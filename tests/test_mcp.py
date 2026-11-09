@@ -567,6 +567,18 @@ class SpectatorTest(unittest.TestCase):
             self.assertEqual(msgs[1]["seq"], f2["seq"])
             self.assertLess(msgs[0]["seq"], f2["seq"])
 
+            # Moves without a thought: the 8th result asks the agent to
+            # narrate, once; a thought starts the count again.
+            nudge = "had no `thought`"
+            for i in range(1, 9):
+                text, err = c.call("send_keys", keys="<esc>")
+                self.assertFalse(err, text)
+                self.assertEqual(nudge in text, i == 8, (i, text[-300:]))
+            self.assertNotIn(nudge, c.call("get_screen")[0])
+            c.call("send_keys", keys="<esc>", thought="Closing menus.")
+            for _ in range(7):
+                self.assertNotIn(nudge, c.call("send_keys", keys="<esc>")[0])
+
             c.call("end_game")
             self.assertEqual(frame()["status"], "game over")
         finally:

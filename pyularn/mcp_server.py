@@ -119,9 +119,14 @@ MESSAGE_ROW = 19   # screen rows: 0-16 the map, 17-18 status, 19-23 messages
 
 THOUGHT_SCHEMA = {
     "type": "string",
-    "description": "Optional: a sentence or two on what you are doing and why, in plain "
-                   "words. People watching the live view see it scroll under the game.",
+    "description": "A sentence or two on what you are doing and why, in plain words. "
+                   "People watching the live view see it scroll under the game, so while "
+                   "the view is on, give one with most moves, not only at milestones.",
 }
+
+# With the live view on, a game call's result reminds the agent to narrate
+# after this many calls in a row without a thought (and every as many after).
+QUIET_NUDGE = 8
 
 
 def _keys_label(keys, limit=24):
@@ -150,6 +155,8 @@ class GameSession:
         self.record_dir = None  # from --record
         self.recorder = None    # pyularn.recorder.RunRecorder for this game
         self.waiting = None     # what the game is waiting for; see _hook_input
+        self.quiet = 0          # game calls in a row without a thought (live view on)
+        self.nudge_due = False  # the next result reminds the agent to narrate
 
     def ensure_spectator(self, force=False):
         """Bind the --watch port if not bound yet.  Binding waits for the
@@ -189,6 +196,7 @@ class GameSession:
         self.error = None
         self.outcome = None
         self.recorder = None
+        self.quiet, self.nudge_due = 0, False
         self.game_id += 1
         self.ensure_spectator(force=True)
         if self.spectator is not None or self.watch is not None:
@@ -225,10 +233,16 @@ class GameSession:
 
     def publish_thought(self, text, action=None):
         """Show the agent's narration on the live page (ahead of the frames
-        its keys produce).  A no-op without --watch."""
+        its keys produce).  A no-op without --watch.  Every game call comes
+        through here, with or without a thought, to count quiet stretches."""
         text = str(text or "").strip()[:MAX_THOUGHT]
-        if not text or self.ensure_spectator() is None:
+        if self.ensure_spectator() is None:
             return
+        if not text:
+            self.quiet += 1
+            self.nudge_due = self.quiet % QUIET_NUDGE == 0
+            return
+        self.quiet = 0
         from . import player, spectator
 
         self.spectator.publish({
@@ -573,6 +587,11 @@ def _result(include_state=False, note=None):
         outcome = SESSION.final_outcome()
         if outcome is not None:  # the state already carries it
             parts.append("Outcome:\n" + json.dumps(outcome, indent=1))
+    if SESSION.nudge_due:
+        SESSION.nudge_due = False
+        parts.append("Live view: your last %d moves had no `thought`, so the people "
+                     "watching cannot tell what you are doing. Add a short `thought` "
+                     "(what you are doing and why) to your next move." % SESSION.quiet)
     return "\n\n".join(parts)
 
 
