@@ -226,9 +226,38 @@ what happens to it from the results:
   other seeds do not count towards a trial.
 
 Every verdict is logged with its numbers under "Decisions" in
-`CAMPAIGN.md`. The rules are set when a campaign starts (`pyularn-coach
---budget 5 --margin 1 --holdout 3 --patience 3`) and then stay fixed, so
-all its strategies are judged the same way.
+`CAMPAIGN.md`. The rules, including the ladder's below, are set when a
+campaign starts (`pyularn-coach --budget 5 --margin 1 --holdout 3
+--patience 3 --window 5 --wins 3 --top 5`) and then stay fixed, so all its
+strategies are judged the same way.
+
+#### The difficulty ladder
+
+A campaign plays one difficulty at a time and climbs:
+
+| Rule | Default | Meaning |
+|---|---|---|
+| `window` | 5 | The ladder looks at this many of the latest finished games at the current difficulty. |
+| `wins` | 3 | When this many of them were won, the campaign moves up one difficulty. |
+| `top` | 5 | The difficulty at which the campaign is complete. Ularn goes up to 100. |
+
+What carries over to the next difficulty and what does not:
+
+- The playbook carries over. Lessons from an easier difficulty are marked
+  with where they were learned, and the briefing warns that some may stop
+  working.
+- The strategy tree and the base carry over, but their results do not:
+  games are only ever compared within one difficulty. The base is measured
+  again on new seeds, strategies that were mid-trial start again, and a
+  stalled line gets another chance. Ideas abandoned earlier stay abandoned
+  unless proposed again with a reason.
+- Each campaign game runs with a scoreboard of its own. Ularn itself
+  remembers a win and starts that player's next game one difficulty up,
+  owing taxes; a campaign needs several wins at one difficulty and games
+  that do not affect each other.
+
+`CAMPAIGN.md` and the briefing show where the campaign stands: the
+difficulty, games and wins there, and each difficulty cleared so far.
 
 #### One cycle
 
@@ -273,9 +302,10 @@ options: `--model`, `--max-budget-usd` (a spending cap per game),
 `--timeout`, `--watch PORT` for the live page, and `--difficulty` for a new
 campaign.
 
-The coach gives each campaign its own scoreboard (`DIR/home`), writes each
-agent's output to `DIR/coach-logs/`, and stops when the game is won or when
-two cycles in a row fail to finish a game.
+The coach writes each agent's output to `DIR/coach-logs/` and prints every
+decision the campaign makes as it happens. It stops after the cycles asked
+for, when the top of the ladder is cleared, or when two cycles in a row
+fail to finish a game. Run it again later to carry on where it left off.
 
 The recordings are also readable outside an agent:
 

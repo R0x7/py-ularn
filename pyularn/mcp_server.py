@@ -591,6 +591,7 @@ def _campaign_defaults(args):
     if sid not in campaign["strategies"]:
         return args
     args = dict(args)
+    args["_campaign_root"] = root
     args["hypotheses"] = learn.changes(campaign, sid) or [campaign["strategies"][sid]["change"]]
     args["difficulty"] = campaign["difficulty"]
     from . import runs
@@ -605,8 +606,38 @@ def _campaign_defaults(args):
     return args
 
 
+_OWN_HOME = []   # the PYULARN_HOME this process started with, once noted
+
+
+def _set_home(campaign_root):
+    """Give a campaign game a scoreboard of its own.
+
+    Ularn remembers a win: that player's next game starts one difficulty
+    higher, owing taxes.  A campaign needs several wins at one difficulty
+    and games that do not affect each other, so each of its games runs with
+    an empty home folder.  Other games keep the home the server started with.
+    """
+    import os
+    import shutil
+
+    if not _OWN_HOME:
+        _OWN_HOME.append(os.environ.get("PYULARN_HOME"))
+    if campaign_root is None:
+        if _OWN_HOME[0] is None:
+            os.environ.pop("PYULARN_HOME", None)
+        else:
+            os.environ["PYULARN_HOME"] = _OWN_HOME[0]
+        return
+    home = os.path.join(campaign_root, "home", "server-%d" % os.getpid())
+    shutil.rmtree(home, ignore_errors=True)
+    os.makedirs(home, exist_ok=True)
+    os.environ["PYULARN_HOME"] = home
+
+
 def tool_new_game(args):
     args = _campaign_defaults(args)
+    SESSION.stop()   # the game in progress, if any, ends in the home it was started in
+    _set_home(args.get("_campaign_root"))
     cls = str(args.get("character_class", "") or "").strip().lower()
     cls = CLASSES.get(cls, cls)
     if cls and cls not in "abcdefgh":

@@ -17,7 +17,8 @@ Claude Code in headless mode::
 Use ``--agent-cmd`` for another one; ``{prompt}`` and ``{mcp_config}`` in
 it are replaced.  The coach itself makes no decisions about the game: it
 starts agents, checks that each left a finished, written-up run behind,
-and stops when asked to, when the game is won, or when agents keep failing.
+and stops after the cycles asked for, when the campaign has cleared the top
+of its difficulty ladder, or when agents keep failing.
 """
 
 import argparse
@@ -128,7 +129,10 @@ def main(argv=None):
     for rule, text in (("budget", "games in a strategy's trial"),
                        ("margin", "progress a strategy must beat its parent by"),
                        ("holdout", "games on unseen seeds before a strategy is proven"),
-                       ("patience", "failed ideas in a row before stepping back")):
+                       ("patience", "failed ideas in a row before stepping back"),
+                       ("window", "latest games the difficulty ladder looks at"),
+                       ("wins", "wins among those games that move the campaign up a difficulty"),
+                       ("top", "the difficulty at which the campaign is complete")):
         ap.add_argument("--" + rule, type=float if rule == "margin" else int, default=None,
                         help="for a NEW campaign: %s (default %s)" % (text, learn.DEFAULT_RULES[rule]))
     ap.add_argument("--status", action="store_true",
@@ -179,6 +183,9 @@ def main(argv=None):
     failures = 0
     for number in range(1, args.cycles + 1):
         campaign = learn.load(root)
+        if campaign["complete"]:
+            out.write("The campaign is complete: difficulty %d is cleared.\n" % campaign["rules"]["top"])
+            break
         decided = len(campaign["log"])
         sid, why, needs_proposal = learn.choose_next(
             campaign, learn.stats(campaign, runs.list_runs(root)))
@@ -194,8 +201,7 @@ def main(argv=None):
             out.write("  Decision: %s\n" % entry["text"])
         finished = [m for m in new if (m.get("outcome") or {}).get("result") in learn.COUNTED]
         if any((m.get("outcome") or {}).get("won") for m in new):
-            out.write("The game was won at difficulty %d.\n" % campaign["difficulty"])
-            break
+            out.write("  The game was won at difficulty %d.\n" % campaign["difficulty"])
         if finished and ok:
             failures = 0
         else:

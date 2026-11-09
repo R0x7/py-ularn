@@ -52,9 +52,13 @@ class JudgingTest(unittest.TestCase):
         return sid
 
     def play(self, sid, depths, which="trial", result="died", difficulty=0, seeds=None):
-        """Record finished games reaching the given dungeon depths, one per seed."""
+        """Record finished games reaching the given dungeon depths, one per
+        seed.  A depth of "win" is a game that was won."""
         for seed, depth in zip(seeds or self.c["seeds"][which], depths):
-            outcome = {"result": result, "deepest": {"dungeon": depth, "volcano": 0}}
+            if depth == "win":
+                outcome = {"result": "won", "won": True, "deepest": {"dungeon": 15, "volcano": 5}}
+            else:
+                outcome = {"result": result, "deepest": {"dungeon": depth, "volcano": 0}}
             self.games.insert(0, {"run_id": "r%d" % len(self.games), "strategy": sid, "seed": seed,
                                   "difficulty": difficulty, "outcome": outcome,
                                   "progress": learn.progress(outcome)})
@@ -205,6 +209,56 @@ class JudgingTest(unittest.TestCase):
         self.fail("idea b", parent=s2)               # an old branch failing does not stall S4
         self.assertEqual((self.c["base"], self.status(s2)), (s4, "proven"))
 
+    def test_the_difficulty_ladder(self):
+        self.c = learn.new_campaign(rules={"budget": 3, "margin": 1.0, "holdout": 2, "patience": 2,
+                                           "window": 3, "wins": 2, "top": 1})
+        first_seeds = self.c["seeds"]
+        self.play("S1", [2, 2, 2])
+        s2 = self.prove("armour", 4)                      # proven: the base
+        on_trial = self.add("mid-trial")
+        checking = self.add("being checked", status="holdout")
+        stalled = self.add("old line", parent="S1", status="stalled")
+        failed = self.add("bad idea", status="abandoned")
+        extra = [9001, 9002, 9003, 9004]
+
+        self.play(s2, ["win"], seeds=extra)
+        self.assertFalse(self.advance())                  # one win of the last three: stay
+        rung = learn.ladder(self.c, self.games)
+        self.assertEqual((rung["difficulty"], rung["recent_wins"], rung["wins"], rung["window"]),
+                         (0, 1, 2, 3))
+        self.play(s2, [3, 3, 3], seeds=extra[1:])
+        self.play("freestyle", ["win", "win", "win"], seeds=[1, 2, 3])   # not this campaign's
+        self.assertFalse(self.advance())                  # the win has left the window
+        self.assertEqual(learn.ladder(self.c, self.games)["recent_wins"], 0)
+
+        self.play(s2, ["win", 3, "win"], seeds=[9005, 9006, 9007])
+        self.assertTrue(self.advance())                   # two of the latest three
+        self.assertEqual((self.c["difficulty"], self.c["complete"], self.c["base"]), (1, False, s2))
+        (cleared,) = self.c["cleared"]
+        self.assertEqual((cleared["difficulty"], cleared["base"], cleared["wins"], cleared["seeds"]),
+                         (0, s2, 3, first_seeds))
+        self.assertIn("Difficulty 0 cleared: 2 of the last 3 games were won. Moving up to "
+                      "difficulty 1 with %s as the base" % s2, self.c["log"][-1]["text"])
+
+        # The tree carries over; the results do not.
+        self.assertFalse(set(self.c["seeds"]["trial"] + self.c["seeds"]["holdout"])
+                         & set(first_seeds["trial"] + first_seeds["holdout"]))
+        st = learn.stats(self.c, self.games)
+        self.assertEqual((st[s2]["runs"], st["S1"]["runs"]), (0, 0))
+        self.assertEqual([self.status(s) for s in (s2, on_trial, checking, stalled, failed)],
+                         ["proven", "trial", "trial", "proven", "abandoned"])
+        self.assertEqual(self.next()[:2], (s2, "measuring the base, so later ideas have something to beat"))
+        self.assertEqual(learn.next_seed(self.c, s2, st), self.c["seeds"]["trial"][0])
+        self.assertEqual(learn.ladder(self.c, self.games)["games"], 0)
+
+        # Winning at the top completes the campaign, once.
+        self.play(s2, ["win", "win", 2], difficulty=1)
+        self.assertTrue(self.advance())
+        self.assertEqual((self.c["difficulty"], self.c["complete"]), (1, True))
+        self.assertEqual([c["difficulty"] for c in self.c["cleared"]], [0, 1])
+        self.assertIn("the campaign is complete", self.c["log"][-1]["text"])
+        self.assertFalse(self.advance())
+
     def test_upgrading_an_older_campaign(self):
         old = {"version": 1, "goal": "g", "difficulty": 0, "current": "S3", "next_strategy": 4,
                "lessons": [], "next_lesson": 1,
@@ -227,9 +281,13 @@ class JudgingTest(unittest.TestCase):
         self.assertEqual(learn.load(root), c)        # and it is saved that way
 
     def test_rules_are_checked(self):
-        for bad in ({"budget": 0}, {"margin": -1}, {"patience": 0}, {"holdout": -1}, {"luck": 1}):
+        for bad in ({"budget": 0}, {"margin": -1}, {"patience": 0}, {"holdout": -1}, {"luck": 1},
+                    {"wins": 0}, {"wins": 6}, {"window": 2}, {"top": 101}, {"top": -1}):
             with self.assertRaises(learn.LearnError):
                 learn.new_campaign(rules=bad)
+        with self.assertRaises(learn.LearnError):
+            learn.new_campaign(difficulty=6)                 # above the default top of 5
+        self.assertEqual(learn.new_campaign(difficulty=6, rules={"top": 8})["difficulty"], 6)
         self.assertEqual(learn.new_campaign(rules={"budget": None})["rules"], learn.DEFAULT_RULES)
 
 
@@ -429,6 +487,109 @@ class CampaignTest(unittest.TestCase):
         self.assertIn("S2 Armour first proven: trial average 1.02; averaged 1.02 on 1 unseen "
                       "seeds, S1 averaged 0.03 on the trial seeds; it is the new base.", doc)
         self.assertIn("| Progress |", self.read("INDEX.md"))
+
+
+class LadderGameTest(unittest.TestCase):
+    """Real wins, produced through the game engine, inside one process."""
+
+    def setUp(self):
+        from pyularn import mcp_server
+        self.m = mcp_server
+        self.root = tempfile.mkdtemp()
+        self.own_home = tempfile.mkdtemp()
+        self.old_home = os.environ.get("PYULARN_HOME")
+        os.environ["PYULARN_HOME"] = self.own_home
+        self.old_dir = mcp_server.SESSION.record_dir
+        mcp_server.SESSION.record_dir = self.root
+        del mcp_server._OWN_HOME[:]
+        learn.load(self.root, rules={"budget": 1, "holdout": 0, "window": 2, "wins": 2, "top": 1})
+
+    def tearDown(self):
+        self.m.SESSION.stop()
+        self.m.SESSION.record_dir = self.old_dir
+        del self.m._OWN_HOME[:]
+        if self.old_home is None:
+            del os.environ["PYULARN_HOME"]
+        else:
+            os.environ["PYULARN_HOME"] = self.old_home
+
+    def state(self, text):
+        return json.loads(text.split("State:\n", 1)[1])
+
+    def win(self):
+        """Start a campaign game and win it the way the game does: by
+        reporting DIED_WINNER, then paging through the score screens."""
+        from pyularn import scores
+        import pyularn.ularn as ularn
+        state = self.state(self.m.tool_new_game({"strategy": "S1", "character_class": "dwarf"}))
+        parse = ularn.parse
+        ularn.parse = lambda action: scores.died(scores.DIED_WINNER, 0)
+        try:
+            self.m.SESSION.send(".")
+        finally:
+            ularn.parse = parse
+        for _ in range(12):
+            if self.m.SESSION.term.finished:
+                break
+            self.m.tool_send_keys({"keys": "<enter>"})
+        self.assertTrue(self.m.SESSION.term.finished, self.m.SESSION.screen())
+        return state
+
+    def test_wins_climb_the_ladder(self):
+        first = self.win()
+        self.assertEqual(first["difficulty"], 0)
+        played = runs.list_runs(self.root)
+        self.assertEqual(played[0]["outcome"]["result"], "won")
+        self.assertEqual(played[0]["progress"]["milestone"], "won")
+        campaign = learn.load(self.root)
+        self.assertEqual((campaign["difficulty"], campaign["cleared"]), (0, []))   # one win of two
+
+        # Ularn would start this player's next game one difficulty up, owing
+        # taxes.  A campaign game has a scoreboard of its own, so it does not.
+        second = self.win()
+        self.assertEqual(second["difficulty"], 0)
+        self.assertIn(os.path.join(self.root, "home"), os.environ["PYULARN_HOME"])
+
+        campaign = learn.load(self.root)
+        self.assertEqual((campaign["difficulty"], campaign["complete"]), (1, False))
+        text = self.m.tool_get_briefing({})
+        self.assertIn("Difficulty 1, on a ladder that ends at 1. 0 games played here, 0 won. "
+                      "The ladder moves up when 2 of the latest 2 games are won; so far 0 are.", text)
+        self.assertIn("- Difficulty 0 cleared", text)
+        self.assertIn(": 2 wins in 2 games, with S1 as the base.", text)
+        self.assertIn("This difficulty is new.", text)
+        self.assertIn("Why this one: measuring the base", text)
+
+        # The next games are played at the new difficulty; two wins finish it.
+        self.assertEqual(self.win()["difficulty"], 1)
+        self.assertEqual(self.win()["difficulty"], 1)
+        campaign = learn.load(self.root)
+        self.assertTrue(campaign["complete"])
+        self.assertIn("The campaign is complete", self.m.tool_get_briefing({}))
+        with open(os.path.join(self.root, "CAMPAIGN.md"), encoding="utf-8") as f:
+            doc = f.read()
+        self.assertIn("**The campaign is complete: difficulty 1, the top of its ladder, is cleared.**", doc)
+        self.assertIn("- Difficulty 1 cleared", doc)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = coach.main(["--dir", self.root, "--cycles", "3", "--agent-cmd", "no-such-agent"])
+        self.assertEqual(code, 0)
+        self.assertIn("The campaign is complete: difficulty 1 is cleared.", out.getvalue())
+        self.assertNotIn("Cycle 1", out.getvalue())
+
+        # A game outside the campaign uses the server's own home again.
+        self.m.tool_new_game({"character_class": "dwarf"})
+        self.assertEqual(os.environ["PYULARN_HOME"], self.own_home)
+
+    def test_lessons_remember_their_difficulty(self):
+        learn.add_lesson(self.root, "Buy armour first.")
+        campaign = learn.load(self.root)
+        self.assertEqual(campaign["lessons"][0]["difficulty"], 0)
+        self.assertIn("- L1: Buy armour first.\n", learn.briefing(self.root) + "\n")
+        campaign["difficulty"] = 1
+        learn.save(self.root, campaign)
+        self.assertIn("- L1: Buy armour first. [learned at difficulty 0]", learn.briefing(self.root))
 
 
 class NoRecordingTest(unittest.TestCase):

@@ -27,6 +27,13 @@ seeds that its parent played too, and is then judged by `advance()`:
   has *stalled*: the base steps back to the strategy it grew from, and the
   next idea branches off from there instead.
 
+The difficulty ladder
+---------------------
+A campaign plays one difficulty at a time.  When `wins` of its latest
+`window` games there were won, it moves up one, until `top` is cleared.
+The playbook, the tree and the base carry over; the results do not, since
+games are only ever compared within one difficulty (see `_climb`).
+
 Each cycle of the loop is: read the briefing, play one game under the
 strategy it names, write the post-mortem, then record lessons and, if
 there is a specific idea to test, propose a new strategy.
@@ -51,6 +58,9 @@ DEFAULT_RULES = {
     "margin": 1.0,    # progress points a strategy must beat its parent by
     "holdout": 3,     # games on unseen seeds before a strategy is proven
     "patience": 3,    # failed ideas in a row before a line has stalled
+    "window": 5,      # the ladder looks at this many of the latest games...
+    "wins": 3,        # ...and moves up a difficulty when this many were won
+    "top": 5,         # the difficulty at which the campaign is complete
 }
 
 GOAL = ("Win Ularn: find the potion of cure dianthroritis and bring it home "
@@ -116,6 +126,10 @@ def _check_rules(rules):
             out[key] = value
     if out["budget"] < 1 or out["holdout"] < 0 or out["patience"] < 1 or out["margin"] < 0:
         raise LearnError("rules: budget and patience are at least 1; margin and holdout at least 0")
+    if not 1 <= out["wins"] <= out["window"]:
+        raise LearnError("rules: wins is at least 1 and at most window")
+    if not 0 <= out["top"] <= 100:
+        raise LearnError("rules: top is a difficulty, 0 to 100")
     return out
 
 
@@ -131,6 +145,9 @@ def _seeds(n, taken=()):
 
 def new_campaign(difficulty=0, rules=None):
     rules = _check_rules(rules)
+    if difficulty > rules["top"]:
+        raise LearnError("the campaign starts at difficulty %d, above its top of %d"
+                         % (difficulty, rules["top"]))
     trial = _seeds(rules["budget"])
     return {
         "version": 2, "goal": GOAL, "difficulty": difficulty, "created": _now(),
@@ -146,6 +163,8 @@ def new_campaign(difficulty=0, rules=None):
         "base": ROOT_ID, "next_strategy": 2,
         "lessons": [], "next_lesson": 1,
         "log": [],
+        "cleared": [],        # one entry per difficulty the ladder has moved past
+        "complete": False,    # True once the top difficulty is cleared
     }
 
 
@@ -179,6 +198,13 @@ def load(root, create=True, difficulty=0, rules=None, judge=True):
         save(root, campaign)
         return campaign
     changed = _upgrade(campaign)
+    for key, value in DEFAULT_RULES.items():       # rules added since it was written
+        if key not in campaign["rules"]:
+            campaign["rules"][key] = max(value, campaign["difficulty"]) if key == "top" else value
+            changed = True
+    if "cleared" not in campaign:
+        campaign.update(cleared=[], complete=False)
+        changed = True
     if judge and advance(campaign, runs.list_runs(root)):
         changed = True
     if changed:
@@ -392,8 +418,64 @@ def advance(campaign, all_runs):
         if not step:
             step = _step_back(campaign)
         if not step:
+            step = _climb(campaign, all_runs)
+        if not step:
             return changed
         changed = True
+
+
+def ladder(campaign, all_runs):
+    """Where the campaign stands on its current difficulty: the latest
+    `window` finished games there, and how many of them were won."""
+    rules = campaign["rules"]
+    here = [m for m in all_runs
+            if (m.get("outcome") or {}).get("result") in COUNTED
+            and m.get("difficulty") == campaign["difficulty"]
+            and m.get("strategy") in campaign["strategies"]]
+    recent = here[:rules["window"]]
+    return {"difficulty": campaign["difficulty"], "top": rules["top"],
+            "games": len(here), "total_wins": sum(1 for m in here if m["outcome"].get("won")),
+            "recent_wins": sum(1 for m in recent if m["outcome"].get("won")),
+            "wins": rules["wins"], "window": rules["window"]}
+
+
+def _climb(campaign, all_runs):
+    """Move up a difficulty once enough of the latest games here were won.
+
+    Everything learned carries over: the playbook, the strategy tree and
+    the base.  What does not carry over is the evidence.  Results are only
+    ever compared within one difficulty, so the base is measured again on
+    fresh seeds, strategies that were mid-trial start their trials again,
+    and a stalled line gets another chance.  Ideas abandoned at the easier
+    difficulty stay abandoned unless proposed again with a reason.
+    """
+    if campaign["complete"]:
+        return False
+    rung = ladder(campaign, all_runs)
+    if rung["recent_wins"] < rung["wins"]:
+        return False
+    rules, d = campaign["rules"], campaign["difficulty"]
+    campaign["cleared"].append({
+        "difficulty": d, "when": _now(), "base": campaign["base"],
+        "games": rung["games"], "wins": rung["total_wins"], "seeds": campaign["seeds"]})
+    won = "%d of the last %d games were won" % (rung["recent_wins"], min(rung["games"], rung["window"]))
+    if d >= rules["top"]:
+        campaign["complete"] = True
+        _log(campaign, "Difficulty %d cleared: %s. That was the top of the ladder: the campaign "
+             "is complete." % (d, won))
+        return True
+    campaign["difficulty"] = d + 1
+    used = [s for c in campaign["cleared"] for group in c["seeds"].values() for s in group]
+    trial = _seeds(rules["budget"], used)
+    campaign["seeds"] = {"trial": trial, "holdout": _seeds(rules["holdout"], used + trial)}
+    for s in campaign["strategies"].values():
+        if s["status"] == "holdout":
+            s["status"] = "trial"
+        elif s["status"] == "stalled":
+            s["status"] = "proven"
+    _log(campaign, "Difficulty %d cleared: %s. Moving up to difficulty %d with %s as the base, "
+         "to be measured again there on new seeds." % (d, won, d + 1, campaign["base"]))
+    return True
 
 
 def _step_back(campaign):
@@ -470,7 +552,8 @@ def add_lesson(root, text, evidence=(), confidence="tentative"):
             save(root, campaign)
             return lesson
     lesson = {"id": "L%d" % campaign["next_lesson"], "text": text, "evidence": evidence,
-              "status": confidence, "note": None, "added": _now()}
+              "status": confidence, "note": None, "added": _now(),
+              "difficulty": campaign["difficulty"]}
     campaign["next_lesson"] += 1
     campaign["lessons"].append(lesson)
     save(root, campaign)
@@ -540,8 +623,12 @@ def _tree_lines(campaign, strategy_stats, mark):
 
 
 def _lesson_lines(campaign, status):
-    return ["- %s: %s%s" % (l["id"], l["text"],
-                           " (runs: %s)" % ", ".join(l["evidence"]) if l["evidence"] else "")
+    def learned_at(lesson):
+        d = lesson.get("difficulty", campaign["difficulty"])
+        return "" if d == campaign["difficulty"] else " [learned at difficulty %d]" % d
+
+    return ["- %s: %s%s%s" % (l["id"], l["text"], learned_at(l),
+                             " (runs: %s)" % ", ".join(l["evidence"]) if l["evidence"] else "")
             for l in campaign["lessons"] if l["status"] == status]
 
 
@@ -563,14 +650,31 @@ def _rules_text(campaign):
     return text
 
 
+def _ladder_lines(campaign, all_runs):
+    rung = ladder(campaign, all_runs)
+    if campaign["complete"]:
+        lines = ["**The campaign is complete: difficulty %d, the top of its ladder, is cleared.**"
+                 % rung["top"]]
+    else:
+        lines = ["Difficulty %d, on a ladder that ends at %d. %d games played here, %d won. "
+                 "The ladder moves up when %d of the latest %d games are won; so far %d are."
+                 % (rung["difficulty"], rung["top"], rung["games"], rung["total_wins"],
+                    rung["wins"], rung["window"], rung["recent_wins"])]
+    for c in campaign["cleared"]:
+        lines.append("- Difficulty %d cleared %s: %d wins in %d games, with %s as the base."
+                     % (c["difficulty"], c["when"][:10], c["wins"], c["games"], c["base"]))
+    return lines
+
+
 def render(root, campaign=None):
     """CAMPAIGN.md: the playbook, the strategy tree and the decisions, for people."""
     campaign = campaign or load(root)
     all_runs = runs.list_runs(root)
     st = stats(campaign, all_runs)
     lines = ["# Campaign", "", campaign["goal"], "",
-             "Difficulty %s. %d games recorded." % (campaign["difficulty"], len(all_runs)), "",
-             "## Playbook", "", "### Confirmed", ""]
+             "%d games recorded." % len(all_runs), ""]
+    lines += _ladder_lines(campaign, all_runs)
+    lines += ["", "## Playbook", "", "### Confirmed", ""]
     lines += _lesson_lines(campaign, "confirmed") or ["_Nothing confirmed yet._"]
     lines += ["", "### Tentative", ""]
     lines += _lesson_lines(campaign, "tentative") or ["_None._"]
@@ -580,7 +684,8 @@ def render(root, campaign=None):
         lines += ["- %s: ~~%s~~ %s" % (l["id"], l["text"], l.get("note") or "") for l in retracted]
     lines += ["", "## Strategies", "",
               "Each strategy is its parent plus one change. Progress is scored as "
-              "1 per dungeon level, 2 per volcano level, 10 for the cure, 30 for a win.", "",
+              "1 per dungeon level, 2 per volcano level, 10 for the cure, 30 for a win. "
+              "The results shown are those at difficulty %d." % campaign["difficulty"], "",
               _rules_text(campaign), ""]
     lines += _tree_lines(campaign, st, choose_next(campaign, st)[0])
     failed = _failed_lines(campaign)
@@ -635,7 +740,12 @@ def briefing(root):
     sid, why, needs_proposal = choose_next(campaign, st)
     s = strategy(campaign, sid)
     lines = ["# Briefing", "", campaign["goal"], "",
-             "Difficulty %s. %d games recorded so far." % (campaign["difficulty"], len(all_runs)), ""]
+             "%d games recorded so far." % len(all_runs), ""]
+    lines += _ladder_lines(campaign, all_runs) + [""]
+    if campaign["cleared"] and not st[campaign["base"]]["runs"]:
+        lines += ["This difficulty is new. Monsters have more hit points, hit harder and are "
+                  "harder to hit, and give less gold and experience. The playbook was learned "
+                  "on easier games: expect some of it to stop working, and say so when it does.", ""]
     if needs_proposal:
         lines += [PROPOSE_FIRST % ("%s %s" % (sid, s["title"])),
                   "## Otherwise play: %s %s" % (sid, s["title"]), ""]
