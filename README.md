@@ -92,7 +92,12 @@ claude mcp add pyularn -- python -m pyularn.mcp_server --watch 8765
 
 The page redraws the game, with the same sprite tiles as `pyularn --web`
 (or as text), each time the agent's input is handled. It also shows HP, spells, stats, inventory, active effects, known
-spells and the agent's recent keys. Playback can be **Live**, **Smooth**
+spells and the agent's recent keys. Under the game, an **Agent thoughts**
+roll shows what the agent says it is doing: `new_game`, `move` and
+`send_keys` take an optional `thought` string, which the page shows just
+before the moves it explains (the server's instructions ask agents to fill
+it in). The MCP server never sees the model's private reasoning, so the
+roll shows only what the agent chooses to write there. Playback can be **Live**, **Smooth**
 (10 frames/s) or **Slow** (4 frames/s), and you can pause it. The page is
 view-only, and `new_game` includes the address in its result. Use
 `--watch 0` to pick a free port and `--watch-host 0.0.0.0` to allow

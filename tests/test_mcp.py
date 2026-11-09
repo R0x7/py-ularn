@@ -145,17 +145,26 @@ class SpectatorTest(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 urllib.request.urlopen(req, timeout=5)
             self.assertEqual(cm.exception.code, 404)
-            c.call("send_keys", keys="i")
+            c.call("send_keys", keys="i", thought="Checking my pack <first>.")
             f2 = frame()
             self.assertGreater(f2["seq"], f1["seq"])
             self.assertEqual(f2["key"], "i")
             screen = "\n".join("".join(r[0] for r in row) for row in f2["rows"])
             self.assertIn("a)", screen)
 
-            # The event stream starts with the latest frame.
+            # The event stream starts with the game's thoughts, then the
+            # latest frame.
             with urllib.request.urlopen(url + "events", timeout=5) as es:
-                line = es.readline().decode()
-            self.assertTrue(line.startswith("data: {"), line)
+                msgs = []
+                while len(msgs) < 2:
+                    line = es.readline().decode()
+                    if line.startswith("data: "):
+                        msgs.append(json.loads(line[6:]))
+            self.assertEqual(msgs[0]["type"], "thought")
+            self.assertEqual(msgs[0]["text"], "Checking my pack <first>.")
+            self.assertEqual(msgs[0]["action"], "keys i")
+            self.assertEqual(msgs[1]["seq"], f2["seq"])
+            self.assertLess(msgs[0]["seq"], f2["seq"])
 
             c.call("end_game")
             self.assertEqual(frame()["status"], "game over")

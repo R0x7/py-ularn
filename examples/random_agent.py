@@ -1,5 +1,7 @@
 """A toy MCP client: starts the pyularn MCP server with the spectator page
 on, then wanders around at random so you can watch it in a browser.
+It narrates each move with the `thought` argument, which the page shows
+in its "Agent thoughts" roll.
 
     python examples/random_agent.py [--port 8765] [--steps 300] [--delay 0.3]
 
@@ -15,6 +17,13 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+NAMES = {"n": "north", "s": "south", "e": "east", "w": "west",
+         "ne": "north-east", "nw": "north-west", "se": "south-east", "sw": "south-west"}
+MUSINGS = ["Nothing looks dangerous here, so I'll keep exploring.",
+           "I have no plan at all; a coin flip says this way.",
+           "Maybe the stairs are over there?",
+           "Wandering until something interesting turns up."]
 
 
 class Client:
@@ -49,7 +58,8 @@ def main():
     a = ap.parse_args()
 
     c = Client(a.port)
-    text = c.call("new_game", character_class=random.choice("abcdefg"), seed=a.seed)
+    text = c.call("new_game", character_class=random.choice("abcdefg"), seed=a.seed,
+                  thought="Starting a fresh game with a random class. I pick moves at random.")
     print(text.splitlines()[0])
     for _ in range(a.steps):
         time.sleep(a.delay)
@@ -58,10 +68,15 @@ def main():
             break
         screen = c.call("get_screen")
         if "?" in screen.splitlines()[-1] or "(y/n)" in screen or "--more--" in screen.lower():
-            c.call("send_keys", keys=random.choice(["y", "n", "<esc>", "<space>"]))
+            key = random.choice(["y", "n", "<esc>", "<space>"])
+            c.call("send_keys", keys=key,
+                   thought="The game is asking me something; I'll answer %s at random." % key)
         else:
-            c.call("move", direction=random.choice(["n", "s", "e", "w", "ne", "nw", "se", "sw"]),
-                   count=random.randint(1, 4))
+            d = random.choice(list(NAMES))
+            n = random.randint(1, 4)
+            c.call("move", direction=d, count=n,
+                   thought="Heading %s for %d step%s. %s" % (
+                       NAMES[d], n, "s" if n > 1 else "", random.choice(MUSINGS)))
     time.sleep(2)
     c.call("end_game")
     c.proc.stdin.close()

@@ -81,6 +81,7 @@ CLASSES = {
     "ogre": "a", "wizard": "b", "klingon": "c", "elf": "d",
     "rogue": "e", "adventurer": "f", "dwarf": "g", "rambo": "h",
 }
+CLASS_NAMES = {v: k for k, v in CLASSES.items()}
 
 
 def parse_keys(text):
@@ -110,6 +111,23 @@ def parse_keys(text):
         keys.append("\r" if ch == "\n" else ch)
         i += 1
     return keys
+
+
+MAX_THOUGHT = 2000
+
+THOUGHT_SCHEMA = {
+    "type": "string",
+    "description": "Optional: a sentence or two on what you are doing and why, in plain "
+                   "words. People watching the live view see it scroll under the game.",
+}
+
+
+def _keys_label(keys, limit=24):
+    from .spectator import key_label
+
+    parts = [key_label(k) for k in keys[:limit]]
+    text = "".join(p if len(p) == 1 else "<%s>" % p for p in parts)
+    return text + ("..." if len(keys) > limit else "")
 
 
 class GameSession:
@@ -146,7 +164,7 @@ class GameSession:
     def running(self):
         return self.thread is not None and self.thread.is_alive()
 
-    def start(self, seed=None, argv=None):
+    def start(self, seed=None, argv=None, thought=None, action=None):
         from . import engine, term_virtual, ularn
 
         self.stop()
@@ -159,6 +177,8 @@ class GameSession:
         self.ensure_spectator(force=True)
         if self.spectator is not None or self.watch is not None:
             self.term.on_frame = self._on_frame
+        # Before the game runs, so the thought comes ahead of its first screen.
+        self.publish_thought(thought, action)
 
         def target():
             try:
@@ -186,6 +206,19 @@ class GameSession:
             state = None
         self.spectator.publish(spectator.make_frame(
             term, self.game_id, "game over" if term.finished else "playing", state))
+
+    def publish_thought(self, text, action=None):
+        """Show the agent's narration on the live page (ahead of the frames
+        its keys produce).  A no-op without --watch."""
+        text = str(text or "").strip()[:MAX_THOUGHT]
+        if not text or self.ensure_spectator() is None:
+            return
+        from . import player, spectator
+
+        self.spectator.publish({
+            "type": "thought", "game": self.game_id, "text": text,
+            "action": action, "turn": player.gtime, "t": spectator.now_ms(),
+        })
 
     def stop(self):
         if self.term is not None and self.running:
@@ -318,7 +351,8 @@ def tool_new_game(args):
     if cls and cls not in "abcdefgh":
         raise ToolError("character_class must be a-h or one of: " + ", ".join(CLASSES))
     name = str(args.get("player_name") or "Agent")[:20]
-    SESSION.start(seed=args.get("seed"))
+    SESSION.start(seed=args.get("seed"), thought=args.get("thought"),
+                  action="new game" + (" (%s)" % CLASS_NAMES[cls] if cls else ""))
     # Walk through the start-up screens unless the caller wants them.
     if args.get("skip_intro", True):
         for _ in range(6):
@@ -335,7 +369,8 @@ def tool_new_game(args):
                 break
     note = "New game started."
     if SESSION.spectator is not None:
-        note += " Live view for the user: " + SESSION.spectator.url
+        note += (" Live view for the user: " + SESSION.spectator.url +
+                 " (pass `thought` with your moves to narrate for viewers)")
     elif SESSION.watch is not None:
         note += (" Live view unavailable: port %d is in use (another pyularn "
                  "server?); retrying every few seconds." % SESSION.watch[1])
@@ -346,6 +381,8 @@ def tool_send_keys(args):
     keys = parse_keys(str(args.get("keys", "")))
     if not keys:
         raise ToolError("keys is empty")
+    if SESSION.term is not None and not SESSION.term.finished:
+        SESSION.publish_thought(args.get("thought"), "keys " + _keys_label(keys))
     SESSION.send(keys)
     return _result(include_state=bool(args.get("include_state", False)))
 
@@ -358,6 +395,9 @@ def tool_move(args):
     if args.get("run"):
         key = key.upper()
     count = max(1, min(int(args.get("count", 1) or 1), 50))
+    if SESSION.term is not None and not SESSION.term.finished:
+        SESSION.publish_thought(args.get("thought"), "%s %s%s" % (
+            "run" if args.get("run") else "move", d, " x%d" % count if count > 1 else ""))
     SESSION.send([key] * count)
     return _result(include_state=bool(args.get("include_state", False)))
 
@@ -395,6 +435,7 @@ TOOLS = [
                 "seed": {"type": "integer", "description": "Optional RNG seed for a reproducible game."},
                 "player_name": {"type": "string", "description": "Name used if the game asks who you are."},
                 "skip_intro": {"type": "boolean", "description": "Automatically pass the intro screens (default true)."},
+                "thought": THOUGHT_SCHEMA,
             },
         },
         "handler": tool_new_game,
@@ -407,6 +448,7 @@ TOOLS = [
             "properties": {
                 "keys": {"type": "string", "description": "Keys to send, e.g. 'i', 'qa', 'cmle<enter>', '<esc>'."},
                 "include_state": {"type": "boolean", "description": "Also return structured player state."},
+                "thought": THOUGHT_SCHEMA,
             },
             "required": ["keys"],
         },
@@ -422,6 +464,7 @@ TOOLS = [
                 "count": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Number of steps (default 1)."},
                 "run": {"type": "boolean", "description": "Run in that direction instead of stepping."},
                 "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
             },
             "required": ["direction"],
         },
@@ -500,7 +543,10 @@ class Server:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": header.PYULARN_VERSION},
                 "instructions": "Play the roguelike Ularn. Start with new_game, then use "
-                                "move / send_keys and read the returned screen.\n\n" + KEY_REFERENCE,
+                                "move / send_keys and read the returned screen.  When a live view is "
+                                "on, give each new_game / move / send_keys call a short `thought` "
+                                "saying what you are doing and why; viewers see it under the game."
+                                "\n\n" + KEY_REFERENCE,
             }
         if method == "ping":
             return {}

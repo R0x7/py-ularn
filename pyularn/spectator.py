@@ -8,7 +8,8 @@ it.  Watching an MCP game, the page is read-only.  With an `on_keys` handler
 (``pyularn --web``) the page is also the game's keyboard.
 
     GET  /               the page
-    GET  /events         text/event-stream of JSON frames
+    GET  /events         text/event-stream of JSON frames (and the agent's
+                         thoughts: {"type": "thought", ...})
     GET  /frame          the latest frame as JSON
     GET  /ularn_gfx.png  the tile sheet
     POST /keys           {"keys": [...]} (only with on_keys)
@@ -137,6 +138,8 @@ class Spectator:
         self.on_keys = on_keys
         self.title = title
         self.frames = collections.deque(maxlen=history)
+        self.last_frame = None   # the newest screen frame (not a thought)
+        self.thoughts = collections.deque(maxlen=200)
         self.seq = 0
         self.cond = threading.Condition()
         self.closed = False
@@ -161,12 +164,29 @@ class Spectator:
         with self.cond:
             self.seq += 1
             frame["seq"] = self.seq
-            self.frames.append(json.dumps(frame, separators=(",", ":")))
+            data = json.dumps(frame, separators=(",", ":"))
+            self.frames.append(data)
+            if frame.get("type") == "thought":
+                self.thoughts.append((frame.get("game"), data))
+            else:
+                self.last_frame = data
             self.cond.notify_all()
 
     def latest(self):
         with self.cond:
-            return self.frames[-1] if self.frames else None
+            return self.last_frame
+
+    def backlog(self):
+        """What a newly connected page needs: the current game's recent
+        thoughts and the latest screen, and the sequence number they reach."""
+        with self.cond:
+            game = json.loads(self.last_frame)["game"] if self.last_frame else None
+            if self.thoughts and (game is None or self.thoughts[-1][0] > game):
+                game = self.thoughts[-1][0]  # a new game's thought, before its screen
+            out = [d for g, d in self.thoughts if g == game]
+            if self.last_frame:
+                out.append(self.last_frame)
+            return out, self.seq
 
     def since(self, seq, timeout=15):
         """Frames with a sequence number above `seq` (waits up to `timeout`)."""
@@ -259,11 +279,10 @@ class SpectatorHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         try:
-            latest = sp.latest()
-            seq = sp.seq
-            if latest:
-                self.wfile.write(b"data: " + latest.encode() + b"\n\n")
-                self.wfile.flush()
+            backlog, seq = sp.backlog()
+            for f in backlog:
+                self.wfile.write(b"data: " + f.encode() + b"\n\n")
+            self.wfile.flush()
             while not sp.closed:
                 frames, seq2 = sp.since(seq)
                 if not frames:
@@ -341,6 +360,27 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px;
 #term .r { background: currentColor; }
 #term .r > i { color: #000; font-style: normal; }
 #term .u { text-decoration: underline; }
+.left { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+#thoughts { display: flex; flex-direction: column; height: 220px; padding: 0; }
+body.play #thoughts { display: none; }
+#thoughts h2 { margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 8px; }
+#thoughts h2 .count { font-weight: 400; text-transform: none; letter-spacing: 0; }
+#roll { flex: 1; overflow-y: auto; padding: 8px 12px; }
+.th { padding: 4px 0 4px 10px; border-left: 2px solid var(--line); margin: 0 0 8px; }
+.th:last-child { border-left-color: var(--accent); }
+.th p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.th .meta { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+.th .meta code { font: 12px ui-monospace, Consolas, monospace; color: var(--text); }
+.th.new { animation: thin .35s ease-out; }
+@keyframes thin { from { opacity: 0; transform: translateY(6px); } }
+.divider { text-align: center; font-size: 12px; color: var(--muted); margin: 8px 0; }
+#roll .empty { padding: 4px 0; }
+#roll code { font: 12px ui-monospace, Consolas, monospace; }
+#jump { display: none; margin-left: auto; font-size: 12px; padding: 1px 8px;
+  text-transform: none; letter-spacing: 0; }
+#jump.on { display: inline-block; }
+@media (prefers-reduced-motion: reduce) { .th.new { animation: none; } }
 #hint { margin: 10px 0 0; color: var(--muted); font-size: 12px; display: none; }
 body.play #hint { display: block; }
 body.play .watch-only { display: none; }
@@ -392,11 +432,19 @@ kbd:last-child { border-color: var(--accent); color: var(--accent); }
   </div>
 </header>
 <main>
+  <div class="left">
   <div class="game">
     <div id="mapwrap"><canvas id="map" width="0" height="0"></canvas></div>
     <div class="term-scroll"><pre id="term">Waiting for a game to start...</pre></div>
     <p id="hint">Your keyboard goes to the game: letters as in the terminal version, arrow keys and
       Home/PgUp/End/PgDn to move, Enter, Esc, Backspace, Ctrl+letter. Press ? in the game for help.</p>
+  </div>
+  <section id="thoughts" class="card" aria-label="Agent thoughts">
+    <h2>Agent thoughts <span class="count" id="tcount"></span>
+      <button id="jump" type="button">Latest &darr;</button></h2>
+    <div id="roll" aria-live="polite"><div class="empty">No thoughts yet. The agent can narrate by
+      passing <code>thought</code> with its moves.</div></div>
+  </section>
   </div>
   <aside>
     <div class="card">
@@ -463,7 +511,9 @@ function drawMap(m) {
   const wrap = $("mapwrap"), cv = $("map");
   const ts = tileSize(m, wrap.clientWidth);
   const cols = Math.max(1, Math.min(m.w, Math.floor(wrap.clientWidth / ts + 1e-6)));
-  const maxH = Math.max(8 * ts, window.innerHeight - 330);
+  const th = $("thoughts");
+  const below = th.offsetParent ? th.offsetHeight + 16 : 0;
+  const maxH = Math.max(8 * ts, window.innerHeight - 330 - below);
   const rows = Math.max(1, Math.min(m.h, Math.floor(maxH / ts)));
   const [px, py] = m.player;
   const left = Math.max(0, Math.min(m.w - cols, px - Math.floor(cols / 2)));
@@ -527,16 +577,60 @@ function render(f, redraw) {
   $("keys").innerHTML = keys.map(k => `<kbd>${esc(k)}</kbd>`).join("");
 }
 
+// ---- the agent's thoughts, in step with playback
+// The roll follows the newest thought unless the viewer scrolls up.
+let thoughtGame = null, nThoughts = 0, stuck = true;
+const roll = $("roll");
+function nearBottom() { return roll.scrollHeight - roll.scrollTop - roll.clientHeight < 40; }
+function addThought(m) {
+  if (!nThoughts) roll.innerHTML = "";
+  if (thoughtGame !== null && m.game !== thoughtGame) {
+    const d = document.createElement("div");
+    d.className = "divider"; d.textContent = "new game";
+    roll.appendChild(d);
+  }
+  thoughtGame = m.game;
+  const el = document.createElement("div");
+  el.className = "th new";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = "turn " + (m.turn || 0) + (m.action ? " \u00b7 " : "");
+  if (m.action) { const c = document.createElement("code"); c.textContent = m.action; meta.appendChild(c); }
+  const p = document.createElement("p");
+  p.textContent = m.text;
+  el.append(meta, p);
+  roll.appendChild(el);
+  while (roll.children.length > 200) roll.removeChild(roll.firstChild);
+  nThoughts++;
+  $("tcount").textContent = "\u00b7 " + nThoughts;
+  if (stuck) roll.scrollTop = roll.scrollHeight;
+}
+roll.addEventListener("scroll", () => {
+  stuck = nearBottom();
+  $("jump").classList.toggle("on", !stuck);
+});
+$("jump").onclick = e => { stuck = true; roll.scrollTop = roll.scrollHeight; e.currentTarget.blur(); };
+
+function passOver(f) {  // a frame skipped while catching up: keep its key
+  if (f.game !== lastGame) { keys = []; lastGame = f.game; }
+  if (f.key) keys.push(f.key);
+}
+
 function tick() {
   timer = null;
   if (paused || !queue.length) return;
   const delay = +$("speed").value;
-  if (delay === 0 || queue.length > 300) {
-    // Live mode, or far behind: jump to the newest frame but keep the keys.
-    while (queue.length > 1) { const f = queue.shift(); if (f.key && f.game === lastGame) { keys.push(f.key); } }
-    keys = keys.slice(-24);
+  // Live mode, or far behind: jump to the newest frame (keeping the keys).
+  const jump = delay === 0 || queue.length > 300;
+  let f = null;
+  while (queue.length) {
+    const m = queue.shift();
+    if (m.type === "thought") { addThought(m); continue; }
+    if (f) passOver(f);
+    f = m;
+    if (!jump) break;
   }
-  render(queue.shift());
+  if (f) { render(f); keys = keys.slice(-24); }
   if (queue.length) timer = setTimeout(tick, delay);
 }
 function kick() { if (!timer) timer = setTimeout(tick, 0); }
