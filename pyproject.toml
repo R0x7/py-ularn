@@ -22,6 +22,7 @@ classifiers = [
 [project.scripts]
 pyularn = "pyularn.__main__:main"
 pyularn-mcp = "pyularn.mcp_server:main"
+pyularn-runs = "pyularn.runs:main"
 
 [tool.setuptools]
 packages = ["pyularn"]
