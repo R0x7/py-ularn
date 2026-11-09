@@ -64,6 +64,10 @@ class VirtualTerminal(ularn_win.Terminal):
         self.chars = [[" "] * cols for _ in range(rows)]
         self.attrs = [[0] * cols for _ in range(rows)]
         self.pairs = {}
+        self.last_key = None
+        # Optional observer: on_frame(term) is called on the game thread each
+        # time the game is about to wait for a key, and once when it ends.
+        self.on_frame = None
 
     # ------------------------------------------------------------ lifecycle
     def start(self):
@@ -75,14 +79,20 @@ class VirtualTerminal(ularn_win.Terminal):
     def stop(self):
         self.started = False
         with self._cond:
+            already = self._finished
             self._finished = True
             self._cond.notify_all()
+        if not already:
+            self._emit_frame()
 
     def mark_finished(self):
         """Mark the game as over (wakes up wait_for_input)."""
         with self._cond:
+            already = self._finished
             self._finished = True
             self._cond.notify_all()
+        if not already:
+            self._emit_frame()
 
     @property
     def finished(self):
@@ -147,8 +157,20 @@ class VirtualTerminal(ularn_win.Terminal):
         pass
 
     # ------------------------------------------------------------ input
+    def _emit_frame(self):
+        cb = self.on_frame
+        if cb is not None:
+            try:
+                cb(self)
+            except Exception:  # an observer must never break the game
+                import traceback
+                traceback.print_exc()
+
     def getkey(self):
         """Block until a key is queued (signals waiters that we are idle)."""
+        # Called on the game thread with the screen complete for this input:
+        # a consistent moment for observers to look at the game.
+        self._emit_frame()
         with self._cond:
             self.input_requests += 1
             self._waiting = True
@@ -161,6 +183,7 @@ class VirtualTerminal(ularn_win.Terminal):
                 key = self._queue.popleft()
             finally:
                 self._waiting = False
+            self.last_key = key
             self._cond.notify_all()
             return key
 

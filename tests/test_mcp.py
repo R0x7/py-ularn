@@ -11,10 +11,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class McpClient:
-    def __init__(self):
+    def __init__(self, extra_args=()):
         env = dict(os.environ, PYTHONPATH=ROOT, PYULARN_HOME=tempfile.mkdtemp())
+        env.pop("PYULARN_WATCH", None)
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "pyularn.mcp_server"], cwd=ROOT, env=env,
+            [sys.executable, "-m", "pyularn.mcp_server", *extra_args], cwd=ROOT, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8")
         self.next_id = 1
@@ -102,6 +103,45 @@ class McpServerTest(unittest.TestCase):
 
     def test_unknown_method(self):
         self.assertEqual(self.c.request("nope/nope")["error"]["code"], -32601)
+
+
+class SpectatorTest(unittest.TestCase):
+    def test_live_frames(self):
+        import re
+        import urllib.request
+
+        c = McpClient(["--watch", "0"])  # port 0: any free port
+        try:
+            c.request("initialize", {"protocolVersion": "2025-06-18"})
+            text, err = c.call("new_game", character_class="dwarf", seed=3)
+            self.assertFalse(err, text)
+            url = re.search(r"Live view for the user: (\S+)", text).group(1)
+
+            page = urllib.request.urlopen(url, timeout=5).read().decode()
+            self.assertIn("EventSource", page)
+
+            def frame():
+                return json.loads(urllib.request.urlopen(url + "frame", timeout=5).read())
+
+            f1 = frame()
+            self.assertEqual(f1["status"], "playing")
+            self.assertEqual(f1["state"]["stats"]["level"], 1)
+            c.call("send_keys", keys="i")
+            f2 = frame()
+            self.assertGreater(f2["seq"], f1["seq"])
+            self.assertEqual(f2["key"], "i")
+            screen = "\n".join("".join(r[0] for r in row) for row in f2["rows"])
+            self.assertIn("a)", screen)
+
+            # The event stream starts with the latest frame.
+            with urllib.request.urlopen(url + "events", timeout=5) as es:
+                line = es.readline().decode()
+            self.assertTrue(line.startswith("data: {"), line)
+
+            c.call("end_game")
+            self.assertEqual(frame()["status"], "game over")
+        finally:
+            c.close()
 
 
 if __name__ == "__main__":

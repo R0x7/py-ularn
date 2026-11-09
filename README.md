@@ -61,6 +61,29 @@ Claude Desktop / other clients (`mcpServers` config):
 | `key_reference` | Command list, map legend and goal. |
 | `end_game` | Stop the current game. |
 
+### Watching an agent play live
+
+Start the server with `--watch` (or set `PYULARN_WATCH=8765`) and open
+<http://localhost:8765/> in a browser:
+
+```bash
+claude mcp add pyularn -- python -m pyularn.mcp_server --watch 8765
+```
+
+The page redraws the game screen, in colour, each time the agent's input is
+handled. It also shows HP, spells, stats, inventory, active effects, known
+spells and the agent's recent keys. Playback can be **Live**, **Smooth**
+(10 frames/s) or **Slow** (4 frames/s), and you can pause it. The page is
+view-only, and `new_game` includes the address in its result. Use
+`--watch 0` to pick a free port and `--watch-host 0.0.0.0` to allow
+viewers from other machines. If the server runs in WSL2, a Windows browser
+can open `localhost` too.
+
+To see it without an AI client, `python examples/random_agent.py` starts the
+server with the page on and wanders the character around at random.
+
+### How it works
+
 The unmodified game engine runs in a background thread on an in-memory
 terminal (`pyularn.term_virtual.VirtualTerminal`). Each tool call feeds keys,
 then waits until the game is blocked on input again before it returns.
@@ -108,6 +131,7 @@ python tests/fuzz.py deep 20 300    # fuzz every dungeon and volcano level
 | `action.py`, `show.py` | action.c, show.c | player commands, inventory display |
 | `store.py`, `scores.py`, `savegame.py`, `saveutils.py` | store.c, scores.c, savegame.c, saveutils.c | shops, the bank and college, scoreboard, save/restore |
 | `help.py`, `fortune.py`, `diag.py` | help.c, fortune.c, diag.c | help pages, fortunes, diagnostics |
+| `mcp_server.py`, `spectator.py`, `engine.py` | (new) | MCP server, live spectator page, engine reset |
 
 ## License
 

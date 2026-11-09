@@ -120,6 +120,8 @@ class GameSession:
         self.exit_code = None
         self.error = None
         self.lock = threading.Lock()
+        self.spectator = None   # pyularn.spectator.Spectator, if --watch
+        self.game_id = 0
 
     # ----------------------------------------------------------- lifecycle
     @property
@@ -135,6 +137,9 @@ class GameSession:
         self.term = term_virtual.VirtualTerminal()
         self.exit_code = None
         self.error = None
+        self.game_id += 1
+        if self.spectator is not None:
+            self.term.on_frame = self._on_frame
 
         def target():
             try:
@@ -146,6 +151,26 @@ class GameSession:
         self.thread = threading.Thread(target=target, name="ularn-game", daemon=True)
         self.thread.start()
         self.term.wait_for_input(15)
+
+    def _on_frame(self, term):
+        """Publish the screen to the spectator (runs on the game thread,
+        while the game is at a consistent point just before reading a key)."""
+        from . import spectator
+
+        if term is not self.term:  # a stale game shutting down
+            return
+        try:
+            state = self.state()
+        except Exception:
+            state = None
+        self.spectator.publish({
+            "game": self.game_id,
+            "status": "game over" if term.finished else "playing",
+            "key": spectator.key_label(term.last_key),
+            "rows": spectator.screen_runs(term),
+            "state": state,
+            "t": spectator.now_ms(),
+        })
 
     def stop(self):
         if self.term is not None and self.running:
@@ -293,7 +318,10 @@ def tool_new_game(args):
                 SESSION.send("\r")
             else:
                 break
-    return _result(include_state=True, note="New game started.")
+    note = "New game started."
+    if SESSION.spectator is not None:
+        note += " Live view for the user: " + SESSION.spectator.url
+    return _result(include_state=True, note=note)
 
 
 def tool_send_keys(args):
@@ -504,7 +532,23 @@ def _error(mid, code, message):
     return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
 
 
-def main():
+def main(argv=None):
+    import argparse
+    import os
+
+    ap = argparse.ArgumentParser(prog="pyularn-mcp",
+                                 description="MCP server that lets an AI agent play pyularn.")
+    ap.add_argument("--watch", nargs="?", type=int, const=8765, metavar="PORT",
+                    default=int(os.environ["PYULARN_WATCH"]) if os.environ.get("PYULARN_WATCH") else None,
+                    help="serve a live spectator page on PORT (default 8765); "
+                         "also set by the PYULARN_WATCH environment variable")
+    ap.add_argument("--watch-host", default=os.environ.get("PYULARN_WATCH_HOST", "127.0.0.1"),
+                    help="address for the spectator page (default 127.0.0.1)")
+    args = ap.parse_args(argv)
+    if args.watch is not None:
+        from . import spectator
+        SESSION.spectator = spectator.start(args.watch, args.watch_host)
+
     # The protocol owns stdout; anything the game might print goes to stderr.
     out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="\n", line_buffering=True)
     inp = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
@@ -513,6 +557,8 @@ def main():
         Server(out).serve(inp)
     finally:
         SESSION.stop()
+        if SESSION.spectator is not None:
+            SESSION.spectator.close()
     return 0
 
 
