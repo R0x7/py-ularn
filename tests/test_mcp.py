@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -108,6 +109,7 @@ class McpServerTest(unittest.TestCase):
 class SpectatorTest(unittest.TestCase):
     def test_live_frames(self):
         import re
+        import urllib.error
         import urllib.request
 
         c = McpClient(["--watch", "0"])  # port 0: any free port
@@ -126,6 +128,23 @@ class SpectatorTest(unittest.TestCase):
             f1 = frame()
             self.assertEqual(f1["status"], "playing")
             self.assertEqual(f1["state"]["stats"]["level"], 1)
+
+            # The map comes as sprite tiles, with the dwarf's sprite on the
+            # player's square (female 171 / male 187).
+            m = f1["map"]
+            self.assertEqual((m["w"], m["h"]), (67, 17))
+            self.assertEqual(len(m["tiles"]), 67 * 17)
+            px, py = m["player"]
+            self.assertIn(m["tiles"][py * 67 + px], (171, 187))
+            png = urllib.request.urlopen(url + "ularn_gfx.png", timeout=5).read()
+            self.assertTrue(png.startswith(b"\x89PNG"))
+
+            # Watching is read-only.
+            req = urllib.request.Request(url + "keys", data=b'{"keys":["j"]}', method="POST",
+                                         headers={"Content-Type": "application/json"})
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(cm.exception.code, 404)
             c.call("send_keys", keys="i")
             f2 = frame()
             self.assertGreater(f2["seq"], f1["seq"])
@@ -142,6 +161,71 @@ class SpectatorTest(unittest.TestCase):
             self.assertEqual(frame()["status"], "game over")
         finally:
             c.close()
+
+
+class WebPlayTest(unittest.TestCase):
+    """`pyularn --web`: the page is the game's keyboard."""
+
+    def test_play_in_browser(self):
+        import re
+        import urllib.error
+        import urllib.request
+
+        home = tempfile.mkdtemp()
+        env = dict(os.environ, PYULARN_HOME=home, USER="webtester", LOGNAME="webtester",
+                   PYTHONPATH=ROOT)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pyularn", "--web", "0", "--no-browser", "-n"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            env=env, cwd=ROOT, text=True)
+        try:
+            url = None
+            for _ in range(5):
+                m = re.search(r"play the game at (\S+)", proc.stderr.readline())
+                if m:
+                    url = m.group(1)
+                    break
+            self.assertIsNotNone(url)
+
+            def frame():
+                return json.loads(urllib.request.urlopen(url + "frame", timeout=5).read() or b"null")
+
+            def post(body, ctype="application/json", origin=None):
+                headers = {"Content-Type": ctype}
+                if origin:
+                    headers["Origin"] = origin
+                req = urllib.request.Request(url + "keys", data=body, method="POST", headers=headers)
+                return urllib.request.urlopen(req, timeout=5).status
+
+            def wait_for(pred):
+                for _ in range(100):
+                    f = frame()
+                    if f and pred(f):
+                        return f
+                    time.sleep(0.05)
+                self.fail("timed out; last frame %r" % (f and f.get("rows"),))
+
+            page = urllib.request.urlopen(url, timeout=5).read().decode()
+            self.assertIn('"play": true', page)
+
+            f = wait_for(lambda f: f["map"] is None)  # choosing a class
+            self.assertEqual(post(b'{"keys": ["e"]}'), 200)  # rogue
+            f = wait_for(lambda f: f["map"] is not None)
+            seq = f["seq"]
+            self.assertEqual(post(b'{"keys": ["KEY_DOWN"]}'), 200)
+            f = wait_for(lambda f: f["seq"] > seq)
+            self.assertEqual(f["key"], "Down")
+
+            # Only the page itself may type.
+            for args in ((b'{"keys":["j"]}', "text/plain"),
+                         (b'{"keys":["j"]}', "application/json", "http://evil.example")):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    post(*args)
+                self.assertEqual(cm.exception.code, 403)
+        finally:
+            proc.terminate()
+            proc.wait(10)
+            proc.stderr.close()
 
 
 if __name__ == "__main__":

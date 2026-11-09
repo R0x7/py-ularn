@@ -163,14 +163,8 @@ class GameSession:
             state = self.state()
         except Exception:
             state = None
-        self.spectator.publish({
-            "game": self.game_id,
-            "status": "game over" if term.finished else "playing",
-            "key": spectator.key_label(term.last_key),
-            "rows": spectator.screen_runs(term),
-            "state": state,
-            "t": spectator.now_ms(),
-        })
+        self.spectator.publish(spectator.make_frame(
+            term, self.game_id, "game over" if term.finished else "playing", state))
 
     def stop(self):
         if self.term is not None and self.running:

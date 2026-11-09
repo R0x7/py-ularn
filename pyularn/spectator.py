@@ -2,12 +2,16 @@
 
 A tiny HTTP server (standard library only) that serves one page and a
 Server-Sent Events stream.  Every time the game is about to wait for a key,
-the MCP server publishes a frame (screen with colours, player state, the key
-that was just pressed); connected browsers draw it.  The page is read-only.
+the game's owner publishes a frame (screen with colours, the map as sprite
+tiles, player state, the key that was just pressed); connected browsers draw
+it.  Watching an MCP game, the page is read-only.  With an `on_keys` handler
+(``pyularn --web``) the page is also the game's keyboard.
 
-    GET /         the viewer page
-    GET /events   text/event-stream of JSON frames
-    GET /frame    the latest frame as JSON
+    GET  /               the page
+    GET  /events         text/event-stream of JSON frames
+    GET  /frame          the latest frame as JSON
+    GET  /ularn_gfx.png  the tile sheet
+    POST /keys           {"keys": [...]} (only with on_keys)
 """
 
 import collections
@@ -18,6 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import ularn_win
+from .header import data_path
 
 # Curses colour numbers -> CSS colours that read well on a dark background.
 CSS_COLORS = ["#6b7280", "#f87171", "#4ade80", "#facc15",
@@ -80,8 +85,57 @@ def screen_runs(term, ascii_walls=True):
     return rows
 
 
+# Special keys the page may send (as named by the curses terminal).
+SPECIAL_KEYS = {"KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT",
+                "KEY_A1", "KEY_A3", "KEY_B2", "KEY_C1", "KEY_C3"}
+
+
+def make_frame(term, game, status, state):
+    """A frame for the page: screen runs, the map as tiles and the state."""
+    from . import gfx
+
+    try:
+        tiles = gfx.map_frame()
+    except Exception:  # never let the view break the game
+        tiles = None
+    return {
+        "game": game,
+        "status": status,
+        "key": key_label(term.last_key),
+        "rows": screen_runs(term),
+        "map": tiles,
+        "state": state,
+        "t": now_ms(),
+    }
+
+
+_tile_sheet = None
+
+
+def tile_sheet():
+    """The PNG tile sheet bytes (cached)."""
+    global _tile_sheet
+    if _tile_sheet is None:
+        with open(data_path("ularn_gfx.png"), "rb") as f:
+            _tile_sheet = f.read()
+    return _tile_sheet
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # A browser closing a connection early is normal; stay quiet.
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Spectator:
-    def __init__(self, host="127.0.0.1", port=8765, history=4000):
+    def __init__(self, host="127.0.0.1", port=8765, history=1500, on_keys=None,
+                 title="live"):
+        self.on_keys = on_keys
+        self.title = title
         self.frames = collections.deque(maxlen=history)
         self.seq = 0
         self.cond = threading.Condition()
@@ -91,7 +145,7 @@ class Spectator:
         class Handler(SpectatorHandler):
             owner = spectator
 
-        self.httpd = ThreadingHTTPServer((host, port), Handler)
+        self.httpd = _Server((host, port), Handler)
         self.httpd.daemon_threads = True
         self.host, self.port = self.httpd.server_address[:2]
         self.thread = threading.Thread(target=self.httpd.serve_forever,
@@ -140,7 +194,7 @@ class SpectatorHandler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, ctype, body):
-        data = body.encode("utf-8")
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -151,13 +205,50 @@ class SpectatorHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/":
-            self._send(200, "text/html; charset=utf-8", PAGE)
+            page = PAGE.replace("__CONFIG__", json.dumps({
+                "play": self.owner.on_keys is not None, "title": self.owner.title}))
+            self._send(200, "text/html; charset=utf-8", page)
+        elif path == "/ularn_gfx.png":
+            try:
+                self._send(200, "image/png", tile_sheet())
+            except OSError:
+                self._send(404, "text/plain", "tile sheet missing")
         elif path == "/frame":
             self._send(200, "application/json", self.owner.latest() or "null")
         elif path == "/events":
             self.events()
         else:
             self._send(404, "text/plain", "not found")
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path != "/keys" or self.owner.on_keys is None:
+            self._send(404, "text/plain", "not found")
+            return
+        # Only the page itself may type: a JSON content type cannot be sent
+        # cross-site without a CORS preflight (which is never answered), and
+        # a browser's Origin, when given, must be this server.
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host", "")
+        ctype = self.headers.get("Content-Type", "").split(";")[0].strip()
+        if ctype != "application/json" or (
+                origin and origin.split("://", 1)[-1] != host):
+            self._send(403, "text/plain", "forbidden")
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(min(n, 65536)) or b"{}")
+            keys = body.get("keys", [])
+            if not isinstance(keys, list) or len(keys) > 256:
+                raise ValueError
+            keys = [k for k in keys if isinstance(k, str)
+                    and (len(k) == 1 or k in SPECIAL_KEYS)]
+        except (ValueError, AttributeError):
+            self._send(400, "text/plain", "bad request")
+            return
+        if keys:
+            self.owner.on_keys(keys)
+        self._send(200, "application/json", "{}")
 
     def events(self):
         sp = self.owner
@@ -186,15 +277,16 @@ class SpectatorHandler(BaseHTTPRequestHandler):
             pass
 
 
-def start(port, host="127.0.0.1"):
+def start(port, host="127.0.0.1", on_keys=None, title="live"):
     """Start a spectator, or return None (with a message on stderr) on error."""
     try:
-        sp = Spectator(host, port)
+        sp = Spectator(host, port, on_keys=on_keys, title=title)
     except OSError as e:
         sys.stderr.write("pyularn: spectator disabled, cannot listen on %s:%s (%s)\n"
                          % (host, port, e))
         return None
-    sys.stderr.write("pyularn: watch the game at %s\n" % sp.url)
+    sys.stderr.write("pyularn: %s the game at %s\n"
+                     % ("play" if on_keys else "watch", sp.url))
     return sp
 
 
@@ -207,7 +299,7 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ularn Live</title>
+<title>Ularn</title>
 <style>
 :root {
   --bg: #0b0d10; --panel: #13161b; --line: #232831; --text: #e5e7eb;
@@ -226,20 +318,32 @@ h1 span { color: var(--accent); }
 .pill.live { color: #0b0d10; background: var(--hp); border-color: var(--hp); }
 .pill.over { color: #0b0d10; background: var(--hp-low); border-color: var(--hp-low); }
 .spacer { flex: 1; }
-.controls { display: flex; gap: 8px; align-items: center; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.controls label { color: var(--muted); }
 select, button { background: var(--panel); color: var(--text);
   border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font: inherit; cursor: pointer; }
 button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
-main { display: grid; grid-template-columns: minmax(0, auto) 300px; gap: 16px;
-  padding: 16px; align-items: start; justify-content: center; }
-.term-wrap { background: #000; border: 1px solid var(--line); border-radius: 8px;
-  padding: 12px; overflow-x: auto; }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; }
+.seg button:first-child { border-radius: 6px 0 0 6px; }
+.seg button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px;
+  padding: 16px; align-items: start; max-width: 1640px; margin: 0 auto; }
+.game { background: #000; border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px; min-width: 0; }
+#mapwrap { width: 100%; display: none; justify-content: center; margin-bottom: 10px; }
+#mapwrap.on { display: flex; }
+#map { display: block; image-rendering: pixelated; background: #000; }
+.term-scroll { overflow-x: auto; }
 #term { margin: 0; font: 15px/1.25 ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
   white-space: pre; color: #e5e7eb; }
 #term .b { font-weight: 700; }
 #term .r { background: currentColor; }
 #term .r > i { color: #000; font-style: normal; }
 #term .u { text-decoration: underline; }
+#hint { margin: 10px 0 0; color: var(--muted); font-size: 12px; display: none; }
+body.play #hint { display: block; }
+body.play .watch-only { display: none; }
 aside { display: flex; flex-direction: column; gap: 12px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
 .card h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
@@ -263,22 +367,37 @@ kbd:last-child { border-color: var(--accent); color: var(--accent); }
 </head>
 <body>
 <header>
-  <h1><span>ULARN</span> live</h1>
+  <h1><span>ULARN</span> <span id="title" style="color:inherit"></span></h1>
   <span id="conn" class="pill">connecting</span>
   <span id="where" class="pill">-</span>
   <div class="spacer"></div>
   <div class="controls">
-    <label for="speed" style="color:var(--muted)">Playback</label>
-    <select id="speed">
+    <span class="seg" role="group" aria-label="View">
+      <button id="v-tiles" aria-pressed="true">Tiles</button><button id="v-text" aria-pressed="false">Text</button>
+    </span>
+    <label for="zoom">Zoom</label>
+    <select id="zoom">
+      <option value="auto" selected>Auto</option>
+      <option value="fit">Fit width</option>
+      <option value="32">32 px</option>
+      <option value="48">48 px</option>
+    </select>
+    <label for="speed" class="watch-only">Playback</label>
+    <select id="speed" class="watch-only">
       <option value="0">Live</option>
       <option value="100" selected>Smooth (10/s)</option>
       <option value="250">Slow (4/s)</option>
     </select>
-    <button id="pause" aria-pressed="false">Pause</button>
+    <button id="pause" class="watch-only" aria-pressed="false">Pause</button>
   </div>
 </header>
 <main>
-  <div class="term-wrap"><pre id="term">Waiting for a game to start...</pre></div>
+  <div class="game">
+    <div id="mapwrap"><canvas id="map" width="0" height="0"></canvas></div>
+    <div class="term-scroll"><pre id="term">Waiting for a game to start...</pre></div>
+    <p id="hint">Your keyboard goes to the game: letters as in the terminal version, arrow keys and
+      Home/PgUp/End/PgDn to move, Enter, Esc, Backspace, Ctrl+letter. Press ? in the game for help.</p>
+  </div>
   <aside>
     <div class="card">
       <h2>Vitals</h2>
@@ -294,9 +413,24 @@ kbd:last-child { border-color: var(--accent); color: var(--accent); }
   </aside>
 </main>
 <script>
+const CONFIG = __CONFIG__;
 const $ = id => document.getElementById(id);
 const queue = [];
-let paused = false, lastGame = null, keys = [], timer = null;
+let paused = false, lastGame = null, keys = [], timer = null, current = null, over = false;
+const MAP_ROWS = 17;   // the map window is the top 17 lines of the screen
+
+function load(k, d) { try { return localStorage.getItem("ularn." + k) || d; } catch (e) { return d; } }
+function save(k, v) { try { localStorage.setItem("ularn." + k, v); } catch (e) {} }
+let view = load("view", "tiles");
+$("zoom").value = load("zoom", "auto");
+
+document.title = CONFIG.play ? "Ularn" : "Ularn live";
+$("title").textContent = CONFIG.play ? "" : "live";
+if (CONFIG.play) { document.body.classList.add("play"); $("speed").value = "0"; }
+
+const sheet = new Image();
+sheet.onload = () => { if (current) render(current, true); };
+sheet.src = "ularn_gfx.png";
 
 function esc(s) { return s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
 
@@ -316,18 +450,63 @@ function drawScreen(rows) {
   $("term").innerHTML = out.join("\n");
 }
 
+function tileSize(m, width) {
+  const fit = width / m.w, z = $("zoom").value;
+  if (z === "fit") return fit;
+  if (z === "auto") return fit >= 20 ? Math.min(fit, 48) : 32;
+  return +z;
+}
+
+// Draw the map as sprites.  When it does not fit, show a window centred on
+// the player, as the X11 version scrolls its map.
+function drawMap(m) {
+  const wrap = $("mapwrap"), cv = $("map");
+  const ts = tileSize(m, wrap.clientWidth);
+  const cols = Math.max(1, Math.min(m.w, Math.floor(wrap.clientWidth / ts + 1e-6)));
+  const maxH = Math.max(8 * ts, window.innerHeight - 330);
+  const rows = Math.max(1, Math.min(m.h, Math.floor(maxH / ts)));
+  const [px, py] = m.player;
+  const left = Math.max(0, Math.min(m.w - cols, px - Math.floor(cols / 2)));
+  const top = Math.max(0, Math.min(m.h - rows, py - Math.floor(rows / 2)));
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.round(cols * ts * dpr), H = Math.round(rows * ts * dpr);
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  cv.style.width = (cols * ts) + "px"; cv.style.height = (rows * ts) + "px";
+  const ctx = cv.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+  if (!sheet.complete || !sheet.naturalWidth) return;
+  const edge = i => Math.round(i * ts * dpr);
+  const put = (tile, sx, sy) => {
+    const x0 = edge(sx), y0 = edge(sy);
+    ctx.drawImage(sheet, (tile % 16) * 32, Math.floor(tile / 16) * 32, 32, 32,
+                  x0, y0, edge(sx + 1) - x0, edge(sy + 1) - y0);
+  };
+  for (let y = 0; y < rows; y++)
+    for (let x = 0; x < cols; x++)
+      put(m.tiles[(top + y) * m.w + left + x], x, y);
+  if (px >= left && px < left + cols && py >= top && py < top + rows)
+    put(m.cursor, px - left, py - top);
+}
+
 function list(el, items, empty) {
   el.innerHTML = items && items.length
     ? items.map(i => `<li>${esc(i)}</li>`).join("")
     : `<li class="empty">${empty}</li>`;
 }
 
-function render(f) {
-  if (f.game !== lastGame) { keys = []; lastGame = f.game; }
-  if (f.key) { keys.push(f.key); if (keys.length > 24) keys.shift(); }
-  drawScreen(f.rows);
-  const over = f.status === "game over";
-  $("conn").textContent = over ? "game over" : "live";
+function render(f, redraw) {
+  current = f;
+  if (!redraw) {
+    if (f.game !== lastGame) { keys = []; lastGame = f.game; }
+    if (f.key) { keys.push(f.key); if (keys.length > 24) keys.shift(); }
+  }
+  const tiles = view === "tiles" && f.map;
+  $("mapwrap").classList.toggle("on", !!tiles);
+  if (tiles) { drawMap(f.map); drawScreen(f.rows.slice(MAP_ROWS)); }
+  else drawScreen(f.rows);
+  over = f.status === "game over";
+  $("conn").textContent = over ? "game over" : (CONFIG.play ? "playing" : "live");
   $("conn").className = "pill " + (over ? "over" : "live");
   const s = f.state;
   if (s) {
@@ -362,18 +541,66 @@ function tick() {
 }
 function kick() { if (!timer) timer = setTimeout(tick, 0); }
 
-$("pause").onclick = () => {
+function setView(v) {
+  view = v; save("view", v);
+  $("v-tiles").setAttribute("aria-pressed", v === "tiles");
+  $("v-text").setAttribute("aria-pressed", v === "text");
+  if (current) render(current, true);
+}
+setView(view);
+$("v-tiles").onclick = e => { setView("tiles"); e.currentTarget.blur(); };
+$("v-text").onclick = e => { setView("text"); e.currentTarget.blur(); };
+$("zoom").onchange = e => { save("zoom", e.target.value); e.target.blur(); if (current) render(current, true); };
+window.addEventListener("resize", () => { if (current) render(current, true); });
+
+$("pause").onclick = e => {
   paused = !paused;
   $("pause").setAttribute("aria-pressed", paused);
   $("pause").textContent = paused ? "Resume" : "Pause";
+  e.currentTarget.blur();
   if (!paused) kick();
 };
-$("speed").onchange = kick;
+$("speed").onchange = e => { e.target.blur(); kick(); };
+
+// ---- playing: send the keyboard to the game
+if (CONFIG.play) {
+  const NAMED = {
+    ArrowUp: "KEY_UP", ArrowDown: "KEY_DOWN", ArrowLeft: "KEY_LEFT", ArrowRight: "KEY_RIGHT",
+    Home: "KEY_A1", PageUp: "KEY_A3", End: "KEY_C1", PageDown: "KEY_C3", Clear: "KEY_B2",
+    Enter: "\r", Escape: "\x1b", Backspace: "\x08", Tab: "\t",
+  };
+  let pending = [], sending = false;
+  function flush() {
+    if (sending || !pending.length) return;
+    sending = true;
+    const batch = pending; pending = [];
+    fetch("keys", { method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ keys: batch }) })
+      .catch(() => {})
+      .finally(() => { sending = false; flush(); });
+  }
+  document.addEventListener("keydown", e => {
+    if (e.metaKey || e.altKey || e.isComposing) return;
+    if (e.target.tagName === "SELECT") return;
+    let k = null;
+    if (e.ctrlKey) {
+      if (/^[a-z]$/i.test(e.key)) k = String.fromCharCode(e.key.toUpperCase().charCodeAt(0) - 64);
+    } else if (NAMED[e.key]) k = NAMED[e.key];
+    else if (e.key.length === 1) k = e.key;
+    if (k === null) return;
+    e.preventDefault();
+    if (over) return;
+    pending.push(k); flush();
+  });
+}
 
 function connect() {
   const es = new EventSource("events");
   es.onmessage = e => { queue.push(JSON.parse(e.data)); kick(); };
-  es.onerror = () => { $("conn").textContent = "reconnecting"; $("conn").className = "pill"; };
+  es.onerror = () => {
+    if (over) { es.close(); return; }
+    $("conn").textContent = "reconnecting"; $("conn").className = "pill";
+  };
 }
 connect();
 </script>
