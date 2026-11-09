@@ -578,7 +578,7 @@ def _result(include_state=False, note=None):
 
 def _campaign_defaults(args):
     """When `strategy` names a strategy of the campaign, the game takes its
-    hypotheses, character class and difficulty from there."""
+    hypotheses, character class, difficulty and seed from there."""
     from . import learn
 
     sid = str(args.get("strategy") or "").strip()
@@ -593,6 +593,12 @@ def _campaign_defaults(args):
     args = dict(args)
     args["hypotheses"] = learn.changes(campaign, sid) or [campaign["strategies"][sid]["change"]]
     args["difficulty"] = campaign["difficulty"]
+    from . import runs
+    seed = learn.next_seed(campaign, sid, learn.stats(campaign, runs.list_runs(root)))
+    if seed is not None:        # the trial's next seed; None once they are all played
+        args["seed"] = seed
+    else:
+        args.pop("seed", None)
     cls = learn.character_class(campaign, sid)
     if cls:
         args["character_class"] = cls
@@ -803,9 +809,20 @@ def tool_propose_strategy(args):
         raise ToolError("character_class must be one of: " + ", ".join(CLASSES))
     s = _learn(lambda learn, root: learn.propose(
         root, args.get("title"), args.get("change"), parent=args.get("parent") or None,
-        character_class=cls or None))
-    return ("Strategy %s added under %s and set as the one to play next. "
-            "Start the next game with new_game(strategy=\"%s\")." % (s["id"], s["parent"], s["id"]))
+        character_class=cls or None, retry_reason=args.get("retry_reason")))
+
+    def up_next(learn, root):
+        from . import runs
+        campaign = learn.load(root)
+        return learn.choose_next(campaign, learn.stats(campaign, runs.list_runs(root)))[0]
+
+    nxt = _learn(up_next)
+    text = "Strategy %s added, on trial against %s. " % (s["id"], s["parent"])
+    if nxt == s["id"]:
+        text += "It is the one to play next: new_game(strategy=\"%s\")." % s["id"]
+    else:
+        text += "It waits its turn: the next game is %s (see get_briefing)." % nxt
+    return text
 
 
 def tool_add_lesson(args):
@@ -1106,13 +1123,14 @@ TOOLS = [
     },
     {
         "name": "propose_strategy",
-        "description": "Add a strategy to test: an existing strategy plus ONE specific change, so the effect of that change can be seen by comparing the two. It becomes the strategy the next game plays.",
+        "description": "Put a new strategy on trial: a proven strategy plus ONE specific change, so the effect of that change can be seen by comparing the two. It plays a fixed number of games and is kept only if it gets clearly further than its parent; get_briefing explains the rules. An idea that was already abandoned is refused unless retry_reason says what has changed.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "A short name, e.g. 'Armour before the dungeon'."},
                 "change": {"type": "string", "description": "The one thing it does differently from its parent, specific enough to follow, e.g. 'Sell the starting weapon and buy leather armor before entering the dungeon'."},
-                "parent": {"type": "string", "description": "The strategy id it builds on (default: the one played now)."},
+                "parent": {"type": "string", "description": "The proven strategy it builds on (default: the current base)."},
+                "retry_reason": {"type": "string", "description": "Only when proposing an idea that was abandoned before: what is different this time."},
                 "character_class": {"type": "string", "description": "Only if the change is to play another class: ogre, wizard, klingon, elf, rogue, adventurer, dwarf or rambo."},
             },
             "required": ["title", "change"],

@@ -193,20 +193,53 @@ people as `CAMPAIGN.md`.
   `tentative` when seen once and `confirmed` when more than one run agrees.
   A lesson found to be wrong is retracted, not deleted, so it is not
   learned again by mistake.
-- **Strategy tree.** Every strategy is its parent plus one change, so the
-  effect of that change shows when the two are compared. The root, `S1`,
-  is a baseline with no fixed plan.
+- **Strategy tree.** Every strategy is a proven strategy plus one change,
+  so the effect of that change shows when the two are compared. The root,
+  `S1`, is a baseline with no fixed plan.
 - **Progress.** Wins are too rare to learn from at first, so each game is
   scored on how far it got: 1 point per dungeon level, 2 per volcano level,
   10 for holding the cure, 30 for winning. A strategy's results are worked
   out from its recorded games and are never stored separately.
 
-One cycle of the loop, which the server asks agents to follow:
+#### Trying, keeping and backing out of strategies
 
-1. `get_briefing`: the strategy to play and what it tests, the playbook,
-   every strategy tried with how far each got, and the latest games.
-2. `new_game` with that `strategy`. The game takes its hypotheses, class
-   and difficulty from the strategy.
+One game says little, because a roguelike death is mostly luck. So a new
+strategy is on trial for a fixed number of games, and the campaign decides
+what happens to it from the results:
+
+| Rule | Default | Meaning |
+|---|---|---|
+| `budget` | 5 | Games in a trial. Every strategy plays the same seeds, so two strategies are compared on the same dungeons. |
+| `margin` | 1.0 | Average progress a strategy must beat its parent by: one dungeon level deeper. |
+| `holdout` | 3 | Games on seeds nobody has played, which a strategy that passed its trial must then get through without falling below its parent's average. Fixed seeds can be learned by heart; this catches that. |
+| `patience` | 3 | Failed ideas in a row on top of a proven strategy before that line counts as stalled. |
+
+- A strategy that passes both tests is **proven** and becomes the base that
+  new ideas build on.
+- One that does not is **abandoned**, with the numbers, and listed under
+  "Tried and failed" so it is not proposed again. An abandoned idea can be
+  retried only with a `retry_reason` saying what has changed.
+- When a line has **stalled**, the base steps back to the proven strategy it
+  grew from, and the next idea branches off from there.
+- The baseline is measured first, so there is something to beat.
+- Games that were stopped, crashed, or played at another difficulty or on
+  other seeds do not count towards a trial.
+
+Every verdict is logged with its numbers under "Decisions" in
+`CAMPAIGN.md`. The rules are set when a campaign starts (`pyularn-coach
+--budget 5 --margin 1 --holdout 3 --patience 3`) and then stay fixed, so
+all its strategies are judged the same way.
+
+#### One cycle
+
+The server asks agents to follow this loop:
+
+1. `get_briefing`: the strategy to play and why, the playbook, every
+   strategy with how far it got, what was tried and failed, the latest
+   decisions and the latest games. When no idea is waiting, it asks for a
+   new one first.
+2. `new_game` with that `strategy`. The game takes its hypotheses, class,
+   seed and difficulty from the strategy.
 3. Play to the end.
 4. `summarize_run`: a `synopsis`, what `went_wrong`, what `worked` and what
    the next game will try (`next_try`).
@@ -217,7 +250,7 @@ One cycle of the loop, which the server asks agents to follow:
 | Tool | What it does |
 |---|---|
 | `get_briefing` | What to read before a game; starts the campaign if there is none. |
-| `propose_strategy` | Add a strategy: `title`, the one `change`, optional `parent` and `character_class`. It is played next. |
+| `propose_strategy` | Put a strategy on trial: `title`, the one `change`, optional `parent`, `character_class` and `retry_reason`. |
 | `add_lesson` | Add a lesson: `text`, `evidence` (run ids), `confidence`. |
 | `retract_lesson` | Mark lesson `lesson_id` as wrong, with a `reason`. |
 

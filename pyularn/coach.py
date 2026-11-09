@@ -125,6 +125,12 @@ def main(argv=None):
                     help="seconds before a game's agent is stopped (default 3600)")
     ap.add_argument("--watch", type=int, metavar="PORT",
                     help="have the agent's game server show the live page on PORT")
+    for rule, text in (("budget", "games in a strategy's trial"),
+                       ("margin", "progress a strategy must beat its parent by"),
+                       ("holdout", "games on unseen seeds before a strategy is proven"),
+                       ("patience", "failed ideas in a row before stepping back")):
+        ap.add_argument("--" + rule, type=float if rule == "margin" else int, default=None,
+                        help="for a NEW campaign: %s (default %s)" % (text, learn.DEFAULT_RULES[rule]))
     ap.add_argument("--status", action="store_true",
                     help="print the campaign (playbook and strategies) and exit")
     ap.add_argument("--print-command", action="store_true",
@@ -145,10 +151,18 @@ def main(argv=None):
     if args.difficulty is not None and not 0 <= args.difficulty <= 100:
         ap.error("--difficulty is 0 to 100")
     new_campaign = not learn.exists(root)
-    campaign = learn.load(root, difficulty=args.difficulty or 0)
+    rules = {r: getattr(args, r) for r in learn.DEFAULT_RULES}
+    try:
+        campaign = learn.load(root, difficulty=args.difficulty or 0, rules=rules)
+    except learn.LearnError as e:
+        ap.error(str(e))
     if not new_campaign and args.difficulty not in (None, campaign["difficulty"]):
         ap.error("this campaign is at difficulty %d; start another folder for difficulty %d"
                  % (campaign["difficulty"], args.difficulty))
+    if not new_campaign and any(v not in (None, campaign["rules"][r]) for r, v in rules.items()):
+        ap.error("this campaign already has its rules (%s); they are fixed so that its "
+                 "strategies are all judged the same way"
+                 % ", ".join("%s %s" % kv for kv in campaign["rules"].items()))
 
     extra = []
     if args.model:
@@ -165,13 +179,19 @@ def main(argv=None):
     failures = 0
     for number in range(1, args.cycles + 1):
         campaign = learn.load(root)
-        sid = learn.choose_next(campaign, learn.stats(campaign, runs.list_runs(root)))
-        out.write("Cycle %d of %d: strategy %s %s\n" % (
-            number, args.cycles, sid, campaign["strategies"][sid]["title"]))
+        decided = len(campaign["log"])
+        sid, why, needs_proposal = learn.choose_next(
+            campaign, learn.stats(campaign, runs.list_runs(root)))
+        out.write("Cycle %d of %d: %s\n" % (
+            number, args.cycles,
+            "a new idea is needed; the agent will propose one" if needs_proposal else
+            "strategy %s %s (%s)" % (sid, campaign["strategies"][sid]["title"], why)))
         out.flush()
         new, ok = run_cycle(root, number, command, args.timeout, out)
         for meta in new:
             out.write("  " + describe(meta) + "\n")
+        for entry in learn.load(root)["log"][decided:]:
+            out.write("  Decision: %s\n" % entry["text"])
         finished = [m for m in new if (m.get("outcome") or {}).get("result") in learn.COUNTED]
         if any((m.get("outcome") or {}).get("won") for m in new):
             out.write("The game was won at difficulty %d.\n" % campaign["difficulty"])

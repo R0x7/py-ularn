@@ -2,14 +2,30 @@
 
 A campaign lives beside the recorded runs (see `pyularn.runs`)::
 
-    DIR/campaign.json   the playbook's lessons and the strategy tree
+    DIR/campaign.json   the playbook's lessons, the strategy tree, the rules
     DIR/CAMPAIGN.md     the same, for people to read
 
 The playbook holds lessons, each citing the runs that support it.  The
-strategy tree holds the experiments: every strategy is its parent plus one
-change, so the effect of that change can be judged by comparing the two.
-How well a strategy does is never stored: it is worked out from the runs
-recorded under its id, which stay the source of truth.
+strategy tree holds the experiments: every strategy is a proven strategy
+plus one change, so the effect of that change can be judged by comparing
+the two.  How well a strategy does is never stored: it is worked out from
+the runs recorded under its id, which stay the source of truth.
+
+Trying, keeping and backing out of strategies
+---------------------------------------------
+One game says little: a roguelike death is mostly luck.  So a new strategy
+is on *trial* for a fixed number of games (`budget`), on a fixed list of
+seeds that its parent played too, and is then judged by `advance()`:
+
+* It is *proven*, and becomes the base that new ideas build on, if its
+  average progress beats its parent's by `margin`, and then still matches
+  the parent on seeds no strategy has played before (`holdout`).  The second
+  test is there because fixed seeds can be learned by heart.
+* Otherwise it is *abandoned*, with the numbers, and stays on record so it
+  is not proposed again.  Play goes back to the base for the next idea.
+* If `patience` ideas in a row fail on top of a proven strategy, that line
+  has *stalled*: the base steps back to the strategy it grew from, and the
+  next idea branches off from there instead.
 
 Each cycle of the loop is: read the briefing, play one game under the
 strategy it names, write the post-mortem, then record lessons and, if
@@ -20,6 +36,7 @@ Nothing here touches the game engine.
 
 import json
 import os
+import random
 import time
 
 from . import runs
@@ -27,6 +44,14 @@ from . import runs
 CAMPAIGN_FILE = "campaign.json"
 COUNTED = ("died", "won", "quit")   # results that say something about a strategy
 ROOT_ID = "S1"
+SOLID = ("proven", "stalled")       # strategies a new idea may build on
+
+DEFAULT_RULES = {
+    "budget": 5,      # games in a trial
+    "margin": 1.0,    # progress points a strategy must beat its parent by
+    "holdout": 3,     # games on unseen seeds before a strategy is proven
+    "patience": 3,    # failed ideas in a row before a line has stalled
+}
 
 GOAL = ("Win Ularn: find the potion of cure dianthroritis and bring it home "
         "before the time runs out.")
@@ -34,6 +59,10 @@ GOAL = ("Win Ularn: find the potion of cure dianthroritis and bring it home "
 
 class LearnError(Exception):
     pass
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 # ====================================================================== progress
@@ -78,31 +107,82 @@ def exists(root):
     return os.path.isfile(_path(root))
 
 
-def new_campaign(difficulty=0):
+def _check_rules(rules):
+    out = dict(DEFAULT_RULES)
+    for key, value in (rules or {}).items():
+        if key not in DEFAULT_RULES:
+            raise LearnError("unknown rule %r" % key)
+        if value is not None:
+            out[key] = value
+    if out["budget"] < 1 or out["holdout"] < 0 or out["patience"] < 1 or out["margin"] < 0:
+        raise LearnError("rules: budget and patience are at least 1; margin and holdout at least 0")
+    return out
+
+
+def _seeds(n, taken=()):
+    rng = random.SystemRandom()
+    seeds = []
+    while len(seeds) < n:
+        s = rng.randrange(1, 2 ** 31)
+        if s not in seeds and s not in taken:
+            seeds.append(s)
+    return seeds
+
+
+def new_campaign(difficulty=0, rules=None):
+    rules = _check_rules(rules)
+    trial = _seeds(rules["budget"])
     return {
-        "version": 1, "goal": GOAL, "difficulty": difficulty,
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "version": 2, "goal": GOAL, "difficulty": difficulty, "created": _now(),
+        "rules": rules,
+        # Every strategy plays the same seeds, so two strategies are compared
+        # on the same dungeons.  The hold-out seeds are played only by a
+        # strategy that has passed its trial.
+        "seeds": {"trial": trial, "holdout": _seeds(rules["holdout"], trial)},
         "strategies": {ROOT_ID: {
             "id": ROOT_ID, "parent": None, "title": "Baseline",
             "change": "No fixed plan yet: play sensibly and see how far it gets.",
-            "character_class": None, "status": "active", "note": None,
-            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")}},
-        "current": ROOT_ID, "next_strategy": 2,
+            "character_class": None, "status": "proven", "note": None, "created": _now()}},
+        "base": ROOT_ID, "next_strategy": 2,
         "lessons": [], "next_lesson": 1,
+        "log": [],
     }
 
 
-def load(root, create=True, difficulty=0):
-    """The campaign in `root`.  With `create`, a missing one is started."""
+def _upgrade(campaign):
+    """Bring a campaign written before trials existed up to date."""
+    if campaign.get("version", 1) >= 2:
+        return False
+    rules = _check_rules(None)
+    trial = _seeds(rules["budget"])
+    campaign.update(version=2, rules=rules, base=ROOT_ID, log=[],
+                    seeds={"trial": trial, "holdout": _seeds(rules["holdout"], trial)})
+    campaign.pop("current", None)
+    for s in campaign["strategies"].values():
+        s["status"] = "proven" if s["parent"] is None else "trial"
+        if s["parent"] is not None:
+            s["parent"] = ROOT_ID   # trials are judged against a proven strategy
+    return True
+
+
+def load(root, create=True, difficulty=0, rules=None, judge=True):
+    """The campaign in `root`, with any strategy whose trial is complete
+    judged first.  With `create`, a missing campaign is started."""
     try:
         with open(_path(root), encoding="utf-8") as f:
-            return json.load(f)
+            campaign = json.load(f)
     except FileNotFoundError:
         if not create:
             raise LearnError("no campaign in %s yet" % root)
-    os.makedirs(root, exist_ok=True)
-    campaign = new_campaign(difficulty)
-    save(root, campaign)
+        os.makedirs(root, exist_ok=True)
+        campaign = new_campaign(difficulty, rules)
+        save(root, campaign)
+        return campaign
+    changed = _upgrade(campaign)
+    if judge and advance(campaign, runs.list_runs(root)):
+        changed = True
+    if changed:
+        save(root, campaign)
     return campaign
 
 
@@ -112,7 +192,7 @@ def save(root, campaign):
 
 
 def refresh(root):
-    """Rewrite CAMPAIGN.md after a run has been added or changed."""
+    """Judge and rewrite CAMPAIGN.md after a run has been added or changed."""
     if exists(root):
         campaign = load(root)
         runs._write_text(os.path.join(root, "CAMPAIGN.md"), render(root, campaign))
@@ -125,6 +205,10 @@ def strategy(campaign, sid):
         return campaign["strategies"][sid]
     except (KeyError, TypeError):
         raise LearnError("no strategy called %r; the briefing lists them" % (sid,))
+
+
+def _number(s):
+    return int(s["id"][1:])
 
 
 def lineage(campaign, sid):
@@ -152,35 +236,54 @@ def character_class(campaign, sid):
 
 
 def children(campaign, sid):
-    return [s for s in campaign["strategies"].values() if s["parent"] == sid]
+    return sorted((s for s in campaign["strategies"].values() if s["parent"] == sid), key=_number)
 
 
-def propose(root, title, change, parent=None, character_class=None):
-    """Add a strategy that is `parent` (default: the current one) plus one
-    change, and make it the one to play next."""
+def propose(root, title, change, parent=None, character_class=None, retry_reason=None):
+    """Put a new strategy on trial: a proven strategy (default: the current
+    base) plus one change.  An idea that was already abandoned is refused
+    unless `retry_reason` says what is different this time."""
     title, change = str(title or "").strip(), str(change or "").strip()
+    retry_reason = str(retry_reason or "").strip()
     if not title or not change:
         raise LearnError("a strategy needs a title and the one change it makes")
     campaign = load(root)
-    parent = parent or campaign["current"]
-    strategy(campaign, parent)
-    for s in children(campaign, parent):
-        if s["change"].lower() == change.lower():
+    parent = parent or campaign["base"]
+    p = strategy(campaign, parent)
+    if p["status"] not in SOLID:
+        raise LearnError("%s is %s, so nothing can be built on it yet; build on %s"
+                         % (parent, "still on trial" if p["status"] != "abandoned" else "abandoned",
+                            campaign["base"]))
+    for s in campaign["strategies"].values():
+        if s["change"].lower() != change.lower():
+            continue
+        if s["status"] == "abandoned" and not retry_reason:
+            raise LearnError("%s already tried that and was abandoned: %s. Propose something "
+                             "else, or give retry_reason if things have changed."
+                             % (s["id"], s.get("note")))
+        if s["status"] != "abandoned" and s["parent"] == parent:
             raise LearnError("%s already tests that change" % s["id"])
     sid = "S%d" % campaign["next_strategy"]
     campaign["next_strategy"] += 1
     campaign["strategies"][sid] = {
         "id": sid, "parent": parent, "title": title[:80], "change": change,
-        "character_class": character_class or None, "status": "active", "note": None,
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-    campaign["current"] = sid
+        "character_class": character_class or None, "status": "trial", "note": None,
+        "retry_reason": retry_reason or None, "created": _now()}
     save(root, campaign)
     return campaign["strategies"][sid]
 
 
 def stats(campaign, all_runs):
-    """Results per strategy at the campaign's difficulty, from the runs."""
-    out = {sid: {"runs": 0, "wins": 0, "scores": [], "best": None, "run_ids": []}
+    """Results per strategy at the campaign's difficulty, from the runs.
+
+    "trial" and "holdout" map a seed to the progress score of the first
+    finished game the strategy played on it; those are what it is judged
+    on.  "runs", "mean" and "best" cover every finished game.
+    """
+    trial_seeds = set(campaign["seeds"]["trial"])
+    holdout_seeds = set(campaign["seeds"]["holdout"])
+    out = {sid: {"runs": 0, "wins": 0, "scores": [], "best": None, "run_ids": [],
+                 "trial": {}, "holdout": {}}
            for sid in campaign["strategies"]}
     for meta in reversed(all_runs):                       # oldest first
         st = out.get(meta.get("strategy"))
@@ -196,14 +299,147 @@ def stats(campaign, all_runs):
         st["run_ids"].append(meta.get("run_id"))
         if st["best"] is None or p["score"] > st["best"]["score"]:
             st["best"] = p
+        seed = meta.get("seed")
+        if seed in trial_seeds:
+            st["trial"].setdefault(seed, p["score"])
+        elif seed in holdout_seeds:
+            st["holdout"].setdefault(seed, p["score"])
     for st in out.values():
-        st["mean"] = round(sum(st["scores"]) / len(st["scores"]), 2) if st["scores"] else None
+        st["mean"] = _mean(st["scores"])
+        st["trial_mean"] = _mean(st["trial"].values())
+        st["holdout_mean"] = _mean(st["holdout"].values())
     return out
 
 
+def _mean(values):
+    values = list(values)
+    return round(sum(values) / len(values), 2) if values else None
+
+
+def next_seed(campaign, sid, strategy_stats):
+    """The seed the strategy's next game should use, or None for any."""
+    st = strategy_stats[sid]
+    which = "holdout" if strategy(campaign, sid)["status"] == "holdout" else "trial"
+    for seed in campaign["seeds"][which]:
+        if seed not in st[which]:
+            return seed
+    return None
+
+
+# ====================================================================== judging
+
+def _log(campaign, text):
+    campaign["log"].append({"when": _now(), "text": text})
+
+
+def _abandon(campaign, s, why):
+    s["status"] = "abandoned"
+    s["note"] = why
+    _log(campaign, "%s %s abandoned: %s." % (s["id"], s["title"], why))
+
+
+def _prove(campaign, s, st, why):
+    s["status"] = "proven"
+    s["note"] = why
+    base = campaign["base"]
+    if s["parent"] == base or (st[s["id"]]["trial_mean"] or 0) >= (st[base]["trial_mean"] or 0):
+        campaign["base"] = s["id"]
+        why += "; it is the new base"
+    _log(campaign, "%s %s proven: %s." % (s["id"], s["title"], why))
+
+
+def advance(campaign, all_runs):
+    """Judge every strategy whose games are in, and step back from a line
+    that has stalled.  Changes `campaign`; returns True if anything changed."""
+    rules = campaign["rules"]
+    changed = False
+    while True:
+        st = stats(campaign, all_runs)
+        step = False
+        for s in sorted(campaign["strategies"].values(), key=_number):
+            if s["status"] not in ("trial", "holdout"):
+                continue
+            parent = campaign["strategies"][s["parent"]]
+            mine, theirs = st[s["id"]], st[parent["id"]]
+            if parent["status"] == "abandoned":
+                _abandon(campaign, s, "its parent %s was abandoned" % parent["id"])
+                step = True
+            elif len(theirs["trial"]) < rules["budget"]:
+                continue                     # the parent has not been measured yet
+            elif s["status"] == "trial":
+                if len(mine["trial"]) < rules["budget"]:
+                    continue
+                need = round(theirs["trial_mean"] + rules["margin"], 2)
+                numbers = "averaged %s over %d games, %s averaged %s" % (
+                    mine["trial_mean"], len(mine["trial"]), parent["id"], theirs["trial_mean"])
+                if mine["trial_mean"] < need:
+                    _abandon(campaign, s, "%s and it needed %s" % (numbers, need))
+                elif rules["holdout"]:
+                    s["status"] = "holdout"
+                    _log(campaign, "%s %s passed its trial (%s). Checking it on %d unseen seeds."
+                         % (s["id"], s["title"], numbers, rules["holdout"]))
+                else:
+                    _prove(campaign, s, st, numbers)
+                step = True
+            elif len(mine["holdout"]) >= rules["holdout"]:
+                numbers = "averaged %s on %d unseen seeds, %s averaged %s on the trial seeds" % (
+                    mine["holdout_mean"], len(mine["holdout"]), parent["id"], theirs["trial_mean"])
+                if mine["holdout_mean"] >= theirs["trial_mean"]:
+                    _prove(campaign, s, st, "trial average %s; %s" % (mine["trial_mean"], numbers))
+                else:
+                    _abandon(campaign, s, "passed its trial but did not hold up: " + numbers)
+                step = True
+        if not step:
+            step = _step_back(campaign)
+        if not step:
+            return changed
+        changed = True
+
+
+def _step_back(campaign):
+    """If the latest `patience` ideas built on the base all failed, the base
+    has stalled: go back to the proven strategy it grew from."""
+    base = campaign["strategies"][campaign["base"]]
+    if base["parent"] is None:
+        return False                          # nothing to go back to from the baseline
+    kids = children(campaign, base["id"])
+    recent = kids[-campaign["rules"]["patience"]:]
+    if len(recent) < campaign["rules"]["patience"] or any(k["status"] != "abandoned" for k in recent):
+        return False
+    older = [s for s in lineage(campaign, base["id"])[:-1] if s["status"] == "proven"]
+    if not older:
+        return False
+    base["status"] = "stalled"
+    campaign["base"] = older[-1]["id"]
+    _log(campaign, "%s %s has stalled: the last %d ideas built on it failed (%s). Stepping back "
+         "to %s to branch off in another direction." % (
+             base["id"], base["title"], len(recent), ", ".join(k["id"] for k in recent),
+             campaign["base"]))
+    return True
+
+
 def choose_next(campaign, strategy_stats):
-    """The strategy the next game should play."""
-    return campaign["current"]
+    """The strategy the next game should play: (id, reason, needs_proposal).
+
+    Order: measure the base if it has not played its trial games; finish a
+    hold-out check; finish the trial that is furthest along; otherwise play
+    the base, and ask for a new idea.
+    """
+    rules = campaign["rules"]
+    base = campaign["base"]
+    if len(strategy_stats[base]["trial"]) < rules["budget"]:
+        return base, "measuring the base, so later ideas have something to beat", False
+    live = sorted(campaign["strategies"].values(), key=_number)
+    for s in live:
+        if s["status"] == "holdout":
+            return s["id"], "it passed its trial; this checks it on unseen seeds", False
+    trials = [s for s in live if s["status"] == "trial"
+              and len(strategy_stats[s["parent"]]["trial"]) >= rules["budget"]]
+    if trials:
+        s = max(trials, key=lambda t: (t["parent"] == base, len(strategy_stats[t["id"]]["trial"]),
+                                       -_number(t)))
+        return s["id"], "on trial against %s" % s["parent"], False
+    return base, "no idea is waiting to be tried", True
 
 
 # ====================================================================== lessons
@@ -234,8 +470,7 @@ def add_lesson(root, text, evidence=(), confidence="tentative"):
             save(root, campaign)
             return lesson
     lesson = {"id": "L%d" % campaign["next_lesson"], "text": text, "evidence": evidence,
-              "status": confidence, "note": None,
-              "added": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+              "status": confidence, "note": None, "added": _now()}
     campaign["next_lesson"] += 1
     campaign["lessons"].append(lesson)
     save(root, campaign)
@@ -258,14 +493,26 @@ def retract_lesson(root, lesson_id, reason):
 
 # ====================================================================== reading
 
-def _stat_text(st):
-    if not st or not st["runs"]:
+def _stat_text(campaign, s, st):
+    rules = campaign["rules"]
+    if not st["runs"]:
         return "not played yet"
-    text = "%d game%s, average progress %s, best: %s" % (
-        st["runs"], "" if st["runs"] == 1 else "s", st["mean"], st["best"]["milestone"])
+    if s["status"] == "holdout":
+        text = "trial average %s; %d of %d games on unseen seeds, average %s" % (
+            st["trial_mean"], len(st["holdout"]), rules["holdout"], st["holdout_mean"])
+    elif st["trial"]:
+        text = "%d of %d trial games, average progress %s" % (
+            min(len(st["trial"]), rules["budget"]), rules["budget"], st["trial_mean"])
+    else:
+        text = "%d game%s, average progress %s" % (st["runs"], "" if st["runs"] == 1 else "s", st["mean"])
+    text += ", best: %s" % st["best"]["milestone"]
     if st["wins"]:
         text += ", %d won" % st["wins"]
     return text
+
+
+STATUS_WORDS = {"trial": "on trial", "holdout": "passed its trial, being checked",
+                "proven": "proven", "stalled": "stalled", "abandoned": "abandoned"}
 
 
 def _tree_lines(campaign, strategy_stats, mark):
@@ -273,15 +520,19 @@ def _tree_lines(campaign, strategy_stats, mark):
 
     def walk(sid, depth):
         s = campaign["strategies"][sid]
-        line = "%s- **%s %s**: %s" % ("  " * depth, sid, s["title"], _stat_text(strategy_stats.get(sid)))
-        if s["status"] != "active":
-            line += " [%s%s]" % (s["status"], ": " + s["note"] if s.get("note") else "")
+        tags = [STATUS_WORDS[s["status"]]]
+        if sid == campaign["base"]:
+            tags.append("the base")
+        line = "%s- **%s %s** [%s]: %s" % ("  " * depth, sid, s["title"], ", ".join(tags),
+                                           _stat_text(campaign, s, strategy_stats[sid]))
         if sid == mark:
             line += " ← play this next"
         lines.append(line)
         if s["parent"] is not None:
             lines.append("%s  Change: %s" % ("  " * depth, s["change"]))
-        for child in sorted(children(campaign, sid), key=lambda c: int(c["id"][1:])):
+        if s.get("note") and s["status"] in ("abandoned", "proven"):
+            lines.append("%s  Verdict: %s" % ("  " * depth, s["note"]))
+        for child in children(campaign, sid):
             walk(child["id"], depth + 1)
 
     walk(ROOT_ID, 0)
@@ -294,8 +545,26 @@ def _lesson_lines(campaign, status):
             for l in campaign["lessons"] if l["status"] == status]
 
 
+def _failed_lines(campaign):
+    return ["- %s (%s, on top of %s): %s. Verdict: %s" % (
+        s["change"], s["id"], s["parent"], s["title"], s.get("note"))
+        for s in sorted(campaign["strategies"].values(), key=_number) if s["status"] == "abandoned"]
+
+
+def _rules_text(campaign):
+    r = campaign["rules"]
+    text = ("A new strategy plays %d games on the same seeds as the strategy it builds on. "
+            "It is kept if its average progress is at least %s higher" % (r["budget"], r["margin"]))
+    if r["holdout"]:
+        text += (", and it then does no worse than its parent's average over %d games on seeds "
+                 "nobody has played" % r["holdout"])
+    text += (". Otherwise it is abandoned. After %d failed ideas in a row on top of a proven "
+             "strategy, the search steps back to the one before it." % r["patience"])
+    return text
+
+
 def render(root, campaign=None):
-    """CAMPAIGN.md: the playbook and the strategy tree, for people."""
+    """CAMPAIGN.md: the playbook, the strategy tree and the decisions, for people."""
     campaign = campaign or load(root)
     all_runs = runs.list_runs(root)
     st = stats(campaign, all_runs)
@@ -311,8 +580,16 @@ def render(root, campaign=None):
         lines += ["- %s: ~~%s~~ %s" % (l["id"], l["text"], l.get("note") or "") for l in retracted]
     lines += ["", "## Strategies", "",
               "Each strategy is its parent plus one change. Progress is scored as "
-              "1 per dungeon level, 2 per volcano level, 10 for the cure, 30 for a win.", ""]
-    lines += _tree_lines(campaign, st, choose_next(campaign, st))
+              "1 per dungeon level, 2 per volcano level, 10 for the cure, 30 for a win.", "",
+              _rules_text(campaign), ""]
+    lines += _tree_lines(campaign, st, choose_next(campaign, st)[0])
+    failed = _failed_lines(campaign)
+    if failed:
+        lines += ["", "## Tried and failed", ""] + failed
+    if campaign["log"]:
+        lines += ["", "## Decisions", ""]
+        lines += ["- %s: %s" % (e["when"][:16].replace("T", " "), e["text"])
+                  for e in reversed(campaign["log"])]
     return "\n".join(lines) + "\n"
 
 
@@ -320,8 +597,8 @@ CYCLE_STEPS = """\
 ## Your cycle
 
 1. Start the game: `new_game` with `strategy` set to the id above. The
-   strategy's hypotheses, class and the campaign's difficulty are filled in
-   for you; do not override them.
+   strategy's hypotheses, class, seed and the campaign's difficulty are
+   filled in for you; do not override them.
 2. Play to win, following the strategy and the playbook. Use the skill
    tools (`explore`, `travel_to`, `take_stairs`, `fight`, `flee`, `buy`) and
    `get_state`; use `send_keys` for spells, potions, scrolls and prompts.
@@ -331,31 +608,48 @@ CYCLE_STEPS = """\
 4. Call `add_lesson` for anything this game showed. Cite the run. Use
    `confirmed` only when more than one run agrees; otherwise `tentative`.
    If a lesson in the playbook turned out wrong, call `retract_lesson`.
+   Lessons must hold in any dungeon: the same seeds are played again, so
+   never record where things are on a particular map.
 5. If you have one specific change that should do better, call
    `propose_strategy` with it. One change at a time, so its effect can be
-   seen. Otherwise leave the strategy as it is: it needs more games.
+   seen. It waits its turn; you do not need to propose one every game.
+"""
+
+PROPOSE_FIRST = """\
+## First: propose a strategy
+
+Every idea so far has been judged, and none is waiting. Before you start a
+game, call `propose_strategy` with ONE specific change to %s that the
+playbook and the latest post-mortems suggest, then play the strategy it
+creates. Do not repeat an idea from "Tried and failed" unless something has
+changed, in which case say what in `retry_reason`.
 """
 
 
 def briefing(root):
     """What an agent should read before a game: the strategy to play, the
-    playbook, the tree and how the latest games went."""
+    playbook, the tree, what failed and how the latest games went."""
     campaign = load(root)
     all_runs = runs.list_runs(root)
     st = stats(campaign, all_runs)
-    sid = choose_next(campaign, st)
+    sid, why, needs_proposal = choose_next(campaign, st)
     s = strategy(campaign, sid)
     lines = ["# Briefing", "", campaign["goal"], "",
-             "Difficulty %s. %d games recorded so far." % (campaign["difficulty"], len(all_runs)),
-             "", "## Play this strategy: %s %s" % (sid, s["title"]), "",
-             "Game %d under this strategy (%s)." % (st[sid]["runs"] + 1, _stat_text(st[sid])), ""]
+             "Difficulty %s. %d games recorded so far." % (campaign["difficulty"], len(all_runs)), ""]
+    if needs_proposal:
+        lines += [PROPOSE_FIRST % ("%s %s" % (sid, s["title"])),
+                  "## Otherwise play: %s %s" % (sid, s["title"]), ""]
+    else:
+        lines += ["## Play this strategy: %s %s" % (sid, s["title"]), ""]
+    lines += ["Why this one: %s. So far: %s." % (why, _stat_text(campaign, s, st[sid])), ""]
     cls = character_class(campaign, sid)
     lines.append("Character class: %s." % (cls or "your choice; say why in the post-mortem"))
     todo = changes(campaign, sid)
     if todo:
         lines += ["", "What it does differently from the baseline:", ""]
         lines += ["- " + c for c in todo[:-1]]
-        lines.append("- %s **(the change on trial)**" % todo[-1])
+        lines.append("- %s%s" % (todo[-1], " **(the change on trial)**"
+                                 if s["status"] in ("trial", "holdout") else ""))
     else:
         lines += ["", s["change"]]
 
@@ -368,7 +662,13 @@ def briefing(root):
     if not confirmed and not tentative:
         lines += ["_Empty: this is one of the first games._", ""]
 
-    lines += ["## Strategies tried", ""] + _tree_lines(campaign, st, sid)
+    lines += ["## Strategies", "", _rules_text(campaign), ""] + _tree_lines(campaign, st, sid)
+    failed = _failed_lines(campaign)
+    if failed:
+        lines += ["", "## Tried and failed", "", "Do not propose these again:", ""] + failed
+    if campaign["log"]:
+        lines += ["", "## Latest decisions", ""]
+        lines += ["- " + e["text"] for e in campaign["log"][-4:]]
 
     done = [m for m in all_runs if m.get("outcome")][:5]
     if done:
