@@ -553,14 +553,18 @@ class SpectatorTest(unittest.TestCase):
             screen = "\n".join("".join(r[0] for r in row) for row in f2["rows"])
             self.assertIn("a)", screen)
 
-            # The event stream starts with the game's thoughts, then the
-            # latest frame.
+            # The event stream starts with the server's id (so a page that
+            # reconnects can tell a new run's server), the game's thoughts,
+            # then the latest frame.
             with urllib.request.urlopen(url + "events", timeout=5) as es:
                 msgs = []
-                while len(msgs) < 2:
+                while len(msgs) < 3:
                     line = es.readline().decode()
                     if line.startswith("data: "):
                         msgs.append(json.loads(line[6:]))
+            hello = msgs.pop(0)
+            self.assertEqual(hello["type"], "hello")
+            self.assertTrue(hello["server"])
             self.assertEqual(msgs[0]["type"], "thought")
             self.assertEqual(msgs[0]["text"], "Checking my pack <first>.")
             self.assertEqual(msgs[0]["action"], "keys i")

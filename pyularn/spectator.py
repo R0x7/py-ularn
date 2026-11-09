@@ -20,6 +20,7 @@ import json
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import ularn_win
@@ -141,6 +142,9 @@ class Spectator:
         self.last_frame = None   # the newest screen frame (not a thought)
         self.thoughts = collections.deque(maxlen=200)
         self.seq = 0
+        # Tells a page that reconnects whether it found the same server (and
+        # can skip what it has seen) or a new one (the next agent's run).
+        self.instance = uuid.uuid4().hex[:12]
         self.cond = threading.Condition()
         self.closed = False
         spectator = self
@@ -280,6 +284,8 @@ class SpectatorHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         try:
             backlog, seq = sp.backlog()
+            hello = json.dumps({"type": "hello", "server": sp.instance})
+            self.wfile.write(b"retry: 2000\n\ndata: " + hello.encode() + b"\n\n")
             for f in backlog:
                 self.wfile.write(b"data: " + f.encode() + b"\n\n")
             self.wfile.flush()
@@ -688,12 +694,37 @@ if (CONFIG.play) {
   });
 }
 
+// The page outlives any one server: agents run back to back, each bringing
+// up its own server on this port.  Keep reconnecting, and when a different
+// server answers, start over for its run.
+let server = null, lastSeq = 0;
+function newRun() {
+  queue.length = 0; lastSeq = 0; keys = []; lastGame = null; over = false;
+  if (nThoughts) {
+    const d = document.createElement("div");
+    d.className = "divider"; d.textContent = "new run";
+    roll.appendChild(d);
+    if (stuck) roll.scrollTop = roll.scrollHeight;
+  }
+  thoughtGame = null;
+}
 function connect() {
   const es = new EventSource("events");
-  es.onmessage = e => { queue.push(JSON.parse(e.data)); kick(); };
+  es.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === "hello") {
+      if (server !== null && m.server !== server) newRun();
+      server = m.server;
+      return;
+    }
+    if (m.seq <= lastSeq) return;  // the backlog again, after a reconnect
+    lastSeq = m.seq;
+    queue.push(m); kick();
+  };
   es.onerror = () => {
-    if (over) { es.close(); return; }
-    $("conn").textContent = "reconnecting"; $("conn").className = "pill";
+    $("conn").textContent = over ? "game over · waiting for the next run" : "reconnecting";
+    $("conn").className = "pill" + (over ? " over" : "");
+    if (es.readyState === EventSource.CLOSED) setTimeout(connect, 2000);
   };
 }
 connect();
