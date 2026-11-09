@@ -95,14 +95,18 @@ class RunRecorder:
         self._events.flush()
 
     # ------------------------------------------------------------ recording
-    def action(self, tool, args, thought, state, screen):
-        """Record one tool call and the state the game was left in."""
+    def action(self, tool, args, thought, state, screen, result=None):
+        """Record one tool call and the state the game was left in.  A skill
+        also records its `result` (why it stopped, how many steps it took)."""
         if self.closed:
             return
         self.actions += 1
         ev = {"n": self.actions, "tool": tool, "args": args, "s": compact_state(state)}
         if thought:
             ev["thought"] = thought
+        if result is not None:
+            ev["result"] = {k: v for k, v in result.items()
+                            if k not in ("monsters", "discovered", "stock")}
         self._event("action", **ev)
         self._tail.append({"n": self.actions, "turn": state.get("turns"), "screen": screen})
         level = state.get("level_index")

@@ -77,9 +77,15 @@ Claude Desktop / other clients (`mcpServers` config):
 | `send_keys` | Send keystrokes, e.g. `"i"`, `"qa"`, `"cmle<enter>"`, `"<esc>"`. Special keys: `<esc> <enter> <space> <bs> <tab> <up> <down> <left> <right> <c-r>`. Returns the new screen. |
 | `move` | Step or run in a compass direction (`n s e w ne nw se sw`), with an optional `count`. |
 | `get_screen` | The current 80x24 screen. |
-| `get_state` | JSON: HP, stats, gold, AC/WC, dungeon level, position, turns, inventory, active effects, known spells, plus `seed`, `difficulty`, `time` left, the `deepest` levels visited, the `monsters` shown on the map and, once the game is over, its `outcome`. |
+| `get_state` | JSON: HP, stats, gold, AC/WC, dungeon level, position, turns, inventory, active effects, known spells, plus `seed`, `difficulty`, `time` left, the `deepest` levels visited, the `map`, the `monsters` and `objects` on it, the latest `messages` and, once the game is over, its `outcome`. |
 | `key_reference` | Command list, map legend and goal. |
 | `end_game` | Stop the current game. |
+| `explore` | Skill: explore the level until something needs a decision. Option `until` stops when a target is found. |
+| `travel_to` | Skill: walk to a `target` (name or map symbol) or to `x`, `y`. |
+| `take_stairs` | Skill: go to the known stairs and take them, `direction` `down` or `up`. |
+| `fight` | Skill: attack the nearest visible monster until none is in reach, or HP falls to `min_hp`. |
+| `flee` | Skill: step away from visible monsters until none is within `safe_distance`. |
+| `buy` | Skill: buy `items` at the DND store in town, or return its price list. |
 | `summarize_run` | Write a finished game's post-mortem: `synopsis`, `went_wrong`, `worked`, `next_try`. Needs `--record`. |
 | `list_runs` | Recorded games, newest first, with how each ended and its post-mortem. Filters: `difficulty`, `strategy`, `limit`. Needs `--record`. |
 | `get_run` | One recorded game's full summary. Needs `--record`. |
@@ -90,6 +96,58 @@ random and reports it in the state, so any game can be replayed.
 `monsters` lists only what the map already shows (name, symbol, position,
 distance), nearest first. It follows the game's own display rules, so a
 mimic appears as what it is imitating and unseen monsters are left out.
+
+`map` is the whole play area as the player knows it: 17 strings of 67
+characters, where `map[y][x]` is the cell at position `x`, `y`. It is the
+map on the screen cell for cell, except that every wall is `#` and explored
+floor is `.` (the terminal draws floor and unexplored cells both as
+blanks; the graphical versions tell them apart, as this does). A test
+checks the state against the screen so the two cannot drift apart.
+
+`objects` lists what is known on the current level (stairs, buildings,
+items, known traps) with positions. `messages` holds the message lines
+under the map, and `display` is `map` or `text` (shops and other full-screen
+text, which `get_screen` shows). `input` says what the game is waiting
+for: `{"kind": "command"}` on the map, or
+`{"kind": "prompt", "answers": ["g", "i", "<esc>"]}` when it has asked a
+question and will only take those keys.
+
+### Skills
+
+A full game is thousands of key presses. The skill tools each do a whole
+errand in one call and stop as soon as something needs a decision. Every
+skill returns a `result` saying why it stopped, with the steps taken,
+position, HP and the monsters in view.
+
+| Skill | Stops with |
+|---|---|
+| `explore` | `explored` (nothing left to reach), `found` (the `until` target is known) |
+| `travel_to` | `arrived` (a question asked by the destination is left for the agent), `not_found`, `no_path` |
+| `take_stairs` | `changed_level`, `not_found` (explore first), `refused` |
+| `fight` | `clear`, `no_monsters`, `low_hp`, `unreachable`, `max_turns` |
+| `flee` | `safe`, `cornered`, `max_steps` |
+| `buy` | `done` (with `bought` and `failed`, each with a reason), `listed`, `refused` (taxes owed) |
+
+Any walking skill also stops with `monster_appeared`, `monster_adjacent`,
+`hurt`, `level_changed`, `teleported`, `blocked`, `prompt`, `max_steps` or
+`game_over`.
+
+What the skills will and will not do:
+
+- They only press keys, so they can do nothing a player could not.
+- They use only what the player knows: the map as drawn, and the monsters
+  on it. Undiscovered traps and unseen monsters are invisible to them.
+- They never route through a known trap, pit or teleporter, they open
+  doors, they pick up gold, and they answer "ignore" to anything else they
+  walk over.
+- They will not start while the game is asking a question, or while the
+  character is blind or confused.
+- `fight` is melee only, and `flee` looks one step ahead, so it can run
+  into a dead end. Spells, potions and scrolls are left to the agent
+  (`send_keys`).
+
+The code is in `pyularn/skills.py` and can be used without the MCP server:
+each skill is a function that takes a game session.
 
 ### How a game ended
 
@@ -224,7 +282,7 @@ python tests/fuzz.py deep 20 300    # fuzz every dungeon and volcano level
 | `store.py`, `scores.py`, `savegame.py`, `saveutils.py` | store.c, scores.c, savegame.c, saveutils.c | shops, the bank and college, scoreboard, save/restore |
 | `help.py`, `fortune.py`, `diag.py` | help.c, fortune.c, diag.c | help pages, fortunes, diagnostics |
 | `gfx.py` | ularn_winx11.c | sprite tile numbers for the map (the X11 `GetTile`) |
-| `mcp_server.py`, `recorder.py`, `runs.py`, `spectator.py`, `web.py`, `engine.py` | (new) | MCP server, game recordings, run summaries and index, the web page (watching and `--web` play), engine reset |
+| `mcp_server.py`, `skills.py`, `recorder.py`, `runs.py`, `spectator.py`, `web.py`, `engine.py` | (new) | MCP server, multi-step skills for agents, game recordings, run summaries and index, the web page (watching and `--web` play), engine reset |
 
 The sprite sheet `pyularn/data/ularn_gfx.png` is made from the original
 `data/ularn_gfx.xpm` by `tools/make_tiles.py`. That script also bakes in

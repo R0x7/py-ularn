@@ -67,7 +67,8 @@ class McpServerTest(unittest.TestCase):
         tools = {t["name"] for t in self.c.request("tools/list")["result"]["tools"]}
         self.assertEqual(tools, {"new_game", "send_keys", "move", "get_screen",
                                  "get_state", "key_reference", "end_game",
-                                 "summarize_run", "list_runs", "get_run"})
+                                 "summarize_run", "list_runs", "get_run",
+                                 "explore", "travel_to", "take_stairs", "fight", "flee", "buy"})
         new_game = next(t for t in self.c.request("tools/list")["result"]["tools"]
                         if t["name"] == "new_game")
         self.assertIn("difficulty", new_game["inputSchema"]["properties"])
@@ -172,6 +173,48 @@ class McpServerTest(unittest.TestCase):
         self.c.call("end_game")
         st = json.loads(self.c.call("get_state")[0])
         self.assertEqual(st["outcome"]["result"], "stopped")
+
+    def test_skill_tools(self):
+        text, err = self.c.call("explore")
+        self.assertTrue(err)  # no game yet
+        self.new_game(character_class="dwarf", seed=7)
+
+        def skill(name, **args):
+            text, err = self.c.call(name, **args)
+            self.assertFalse(err, text)
+            self.assertIn("Screen:\n", text)
+            body = text.split("Skill result:\n", 1)[1]
+            return json.JSONDecoder().raw_decode(body)[0], text
+
+        r, _ = skill("explore")
+        self.assertEqual(r["result"], "explored")   # the town is all in view
+        r, text = skill("travel_to", target="bank", include_state=True)
+        self.assertEqual(r["result"], "arrived")
+        state = json.loads(text.split("State:\n", 1)[1])
+        self.assertEqual(state["input"], {"kind": "prompt", "answers": ["g", "i", "<esc>"]})
+        self.assertIn("$", {o["symbol"] for o in state["objects"]})
+        text, err = self.c.call("fight")
+        self.assertTrue(err)
+        self.assertIn("asking something", text)
+        self.c.call("send_keys", keys="<esc>")
+
+        r, _ = skill("buy")
+        self.assertEqual(r["result"], "listed")
+        self.assertTrue(r["stock"])
+        r, _ = skill("fight")
+        self.assertEqual(r["result"], "no_monsters")
+        r, _ = skill("flee")
+        self.assertEqual(r["result"], "safe")
+        r, _ = skill("take_stairs", direction="down", thought="Into the dungeon.")
+        self.assertEqual((r["result"], r["level"]), ("changed_level", "1"))
+
+        for name, args in (("travel_to", {}), ("travel_to", {"target": "nowhere"}),
+                           ("travel_to", {"x": 500, "y": 1}), ("fight", {"min_hp": 2}),
+                           ("explore", {"max_steps": 0}), ("take_stairs", {"direction": "left"}),
+                           ("buy", {"items": "sword"})):
+            text, err = self.c.call(name, **args)
+            self.assertTrue(err, (name, args, text))
+            self.assertNotIn("Traceback", text)
 
     def test_run_tools_need_recording(self):
         for tool, args in (("list_runs", {}), ("get_run", {}),
@@ -296,6 +339,7 @@ class RecordTest(unittest.TestCase):
             c.call("get_state")  # looking is not an action
             ev = events()
             self.assertEqual([e["type"] for e in ev], ["start", "action", "action", "action"])
+            self.assertNotIn("result", ev[1])
             self.assertEqual(ev[0]["state"]["seed"], 21)
             self.assertEqual(ev[1]["tool"], "move")
             self.assertEqual(ev[1]["args"], {"direction": "e", "count": 2, "run": False})
@@ -304,14 +348,23 @@ class RecordTest(unittest.TestCase):
             self.assertEqual(ev[2]["args"], {"keys": "i"})
             self.assertNotIn("thought", ev[2])
 
+            # A skill is one action, with why it stopped.
+            c.call("travel_to", target="home", thought="Going home.")
+            last = events()[-1]
+            self.assertEqual((last["tool"], last["args"]), ("travel_to", {"target": "home"}))
+            self.assertEqual(last["thought"], "Going home.")
+            self.assertEqual(last["result"]["result"], "arrived")
+            self.assertGreater(last["result"]["steps"], 0)
+            self.assertNotIn("monsters", last["result"])
+
             c.call("end_game")
             m = meta()
             self.assertEqual(m["outcome"]["result"], "stopped")
-            self.assertEqual(m["actions"], 3)
+            self.assertEqual(m["actions"], 4)
             end = events()[-1]
             self.assertEqual(end["type"], "end")
             self.assertEqual(end["outcome"], m["outcome"])
-            self.assertEqual(len(end["last_screens"]), 4)
+            self.assertEqual(len(end["last_screens"]), 5)
             self.assertIn("HP:", end["last_screens"][0]["screen"])
 
             # The next game gets a folder of its own.

@@ -115,6 +115,7 @@ def parse_keys(text):
 
 
 MAX_THOUGHT = 2000
+MESSAGE_ROW = 19   # screen rows: 0-16 the map, 17-18 status, 19-23 messages
 
 THOUGHT_SCHEMA = {
     "type": "string",
@@ -148,6 +149,7 @@ class GameSession:
         self.outcome = None     # set by the death hook once the game is lost or won
         self.record_dir = None  # from --record
         self.recorder = None    # pyularn.recorder.RunRecorder for this game
+        self.waiting = None     # what the game is waiting for; see _hook_input
 
     def ensure_spectator(self, force=False):
         """Bind the --watch port if not bound yet.  Binding waits for the
@@ -181,6 +183,7 @@ class GameSession:
         self.seed = seed
         header.set_seed(seed)
         self._hook_death()
+        self._hook_input()
         self.term = term_virtual.VirtualTerminal()
         self.exit_code = None
         self.error = None
@@ -258,6 +261,44 @@ class GameSession:
             self.outcome = None
 
         scores.died = died
+
+    def _hook_input(self):
+        """Keep track of what kind of input the game is blocked on: a command
+        on the map, or a prompt and the keys it accepts.  As with the death
+        hook, the engine's own functions are wrapped, not changed."""
+        from . import ularn_win
+
+        self.waiting = None
+
+        def wrap(name, kind):
+            original = getattr(ularn_win, name)
+
+            def wrapper(*args, **kwargs):
+                previous = self.waiting
+                self.waiting = {"kind": kind,
+                                "answers": args[1] if kind == "prompt" and len(args) > 1 else None}
+                try:
+                    return original(*args, **kwargs)
+                finally:
+                    self.waiting = previous
+
+            setattr(ularn_win, name, wrapper)
+
+        wrap("get_normal_input", "command")
+        wrap("get_prompt_input", "prompt")
+
+    def input_state(self):
+        """What the next key will be read as, for agents."""
+        if self.term is None or self.term.finished:
+            return {"kind": "none"}
+        w = self.waiting
+        if not w:
+            return {"kind": "other"}  # typing a number, a name, a spell code...
+        out = {"kind": w["kind"]}
+        if w["answers"]:
+            names = {chr(27): "<esc>", chr(13): "<enter>", " ": "<space>", chr(12): "<c-l>"}
+            out["answers"] = [names.get(ch, ch) for ch in w["answers"]]
+        return out
 
     def _progress(self):
         """How far the game got; shared by every kind of outcome."""
@@ -342,7 +383,7 @@ class GameSession:
             traceback.print_exc(file=sys.stderr)
             self.recorder = None
 
-    def record_action(self, tool, args, thought=None):
+    def record_action(self, tool, args, thought=None, result=None):
         """Log a tool call after the game handled it, and close the log once
         the game is over."""
         rec = self.recorder
@@ -350,7 +391,7 @@ class GameSession:
             return
         try:
             rec.action(tool, args, str(thought or "").strip()[:MAX_THOUGHT] or None,
-                       self.state(), self.screen())
+                       self.state(), self.screen(), result=result)
         except Exception:
             traceback.print_exc(file=sys.stderr)
         if self.final_outcome() is not None:
@@ -445,6 +486,16 @@ class GameSession:
             for i in range(spell.SPELL_COUNT) if player.spelknow[i]
         ]
         st["monsters"] = _visible_monsters()
+        from . import skills
+        st["objects"] = skills.known_objects(1000)
+        st["input"] = self.input_state()
+        on_map = ularn_win.CurrentDisplayMode == ularn_win.DISPLAY_MAP
+        st["display"] = "map" if on_map else "text"
+        st["map"] = skills.map_rows()
+        # Below the map and the two status lines the screen shows the latest
+        # messages.  In text mode (shops, inventory) the whole screen is text.
+        lines = self.term.text(ascii_walls=True).split("\n")
+        st["messages"] = [l.strip() for l in lines[MESSAGE_ROW:] if l.strip()] if on_map else []
         outcome = self.final_outcome()
         if outcome is not None:
             st["outcome"] = outcome
@@ -469,41 +520,9 @@ def _deepest():
 
 
 def _visible_monsters():
-    """The monsters drawn on the map right now, nearest first.
+    from . import skills
 
-    This follows the display rules of ularn_win.GetTile, so it holds only
-    what the screen already shows: a mimic is listed as what it looks like,
-    and unseen sleepers, invisible stalkers and (without the Eye of Larn)
-    demons are left out.
-    """
-    from . import dungeon, itm, monster, player, ularn_win
-
-    c = player.c
-    if c[player.BLINDCOUNT]:
-        return []
-    px, py = player.playerx, player.playery
-    found = []
-    for x in range(dungeon.MAXX):
-        for y in range(dungeon.MAXY):
-            k = dungeon.mitem[x][y].mon
-            if k == 0 or dungeon.know[x][y] == itm.OUNKNOWN:
-                continue
-            if not dungeon.stealth[x][y] & (dungeon.STEALTH_SEEN | dungeon.STEALTH_AWAKE):
-                continue
-            if k == monster.INVISIBLESTALKER and c[player.SEEINVISIBLE] == 0:
-                continue
-            if monster.DEMONLORD <= k <= monster.LUCIFER and c[player.EYEOFLARN] == 0:
-                continue
-            if k == monster.MIMIC:
-                k = ularn_win.mimicmonst or monster.MIMIC
-            found.append({
-                "name": monster.monster[k].name,
-                "symbol": monster.monstnamelist[k],
-                "x": x, "y": y,
-                "distance": max(abs(x - px), abs(y - py)),
-            })
-    found.sort(key=lambda m: (m["distance"], m["y"], m["x"]))
-    return found
+    return skills.visible_monsters()
 
 
 def _capture(fn, *args):
@@ -733,6 +752,83 @@ def tool_get_run(args):
     return runs.write_summary(_run_path(args))
 
 
+# ----------------------------------------------------------------- skills
+
+def _int_arg(args, name, default, low, high):
+    value = args.get(name)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise ToolError("%s must be a whole number from %d to %d" % (name, low, high))
+    return value
+
+
+def _skill_tool(name, label, run):
+    """Make the handler of a skill tool.  `label(args)` is the short text
+    for the live view; `run(skills, args)` calls the skill."""
+
+    def handler(args):
+        from . import skills
+
+        if SESSION.term is None:
+            raise ToolError("No game in progress. Call new_game first.")
+        if SESSION.term.finished:
+            raise ToolError("The game has ended. Call new_game to play again.")
+        SESSION.publish_thought(args.get("thought"), label(args))
+        try:
+            report = run(skills, args)
+        except skills.SkillError as e:
+            raise ToolError(str(e))
+        logged = {k: v for k, v in args.items() if k not in ("thought", "include_state")}
+        SESSION.record_action(name, logged, args.get("thought"), result=report)
+        return _result(include_state=bool(args.get("include_state", False)),
+                       note="Skill result:\n" + json.dumps(report, indent=1))
+
+    return handler
+
+
+def _travel(skills, args):
+    target, x, y = args.get("target"), args.get("x"), args.get("y")
+    if target is None and (x is None or y is None):
+        raise ToolError("give a target, or both x and y")
+    if target is None:
+        x = _int_arg(args, "x", None, 0, 66)
+        y = _int_arg(args, "y", None, 0, 16)
+    return skills.travel_to(SESSION, target=target, x=x, y=y,
+                            max_steps=_int_arg(args, "max_steps", 300, 1, 2000))
+
+
+def _fight(skills, args):
+    min_hp = args.get("min_hp", 0.35)
+    if isinstance(min_hp, bool) or not isinstance(min_hp, (int, float)) or not 0 <= min_hp < 1:
+        raise ToolError("min_hp is a fraction of maximum HP, from 0 up to 1")
+    return skills.fight(SESSION, max_turns=_int_arg(args, "max_turns", 40, 1, 500),
+                        min_hp=min_hp, reach_distance=_int_arg(args, "reach", 5, 1, 66))
+
+
+tool_explore = _skill_tool(
+    "explore", lambda a: "explore" + (" until %s" % a["until"] if a.get("until") else ""),
+    lambda skills, a: skills.explore(SESSION, max_steps=_int_arg(a, "max_steps", 300, 1, 2000),
+                                     until=a.get("until")))
+tool_travel_to = _skill_tool(
+    "travel_to", lambda a: "travel to %s" % (a.get("target") or "%s,%s" % (a.get("x"), a.get("y"))),
+    _travel)
+tool_take_stairs = _skill_tool(
+    "take_stairs", lambda a: "take the stairs %s" % a.get("direction", "down"),
+    lambda skills, a: skills.take_stairs(SESSION, direction=str(a.get("direction", "down")),
+                                         volcano=bool(a.get("volcano", False)),
+                                         max_steps=_int_arg(a, "max_steps", 300, 1, 2000)))
+tool_fight = _skill_tool("fight", lambda a: "fight", _fight)
+tool_flee = _skill_tool(
+    "flee", lambda a: "flee",
+    lambda skills, a: skills.flee(SESSION, max_steps=_int_arg(a, "max_steps", 20, 1, 500),
+                                  safe_distance=_int_arg(a, "safe_distance", 8, 2, 66)))
+tool_buy = _skill_tool(
+    "buy", lambda a: "buy " + ", ".join(_string_list(a, "items")) if a.get("items") else "price list",
+    lambda skills, a: skills.buy(SESSION, items=_string_list(a, "items"),
+                                 leave=bool(a.get("leave", True))))
+
+
 TOOLS = [
     {
         "name": "new_game",
@@ -795,7 +891,7 @@ TOOLS = [
     },
     {
         "name": "get_state",
-        "description": "Return structured player state as JSON: stats, HP, gold, dungeon level, position, inventory, active effects, known spells, difficulty, seed, time left, the deepest levels visited, the monsters shown on the map and, once the game is over, its outcome.",
+        "description": "Return structured player state as JSON: stats, HP, gold, dungeon level, position, inventory, active effects, known spells, difficulty, seed, time left, the deepest levels visited, the map as the player knows it (17 rows of 67 characters: # wall, . explored floor, blank unexplored, otherwise the screen's symbols), the monsters shown on the map, the objects known on this level (stairs, buildings, items), the latest messages, what kind of input the game is waiting for and, once the game is over, its outcome.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_get_state,
     },
@@ -810,6 +906,94 @@ TOOLS = [
         "description": "Stop the game in progress without saving.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_end_game,
+    },
+    {
+        "name": "explore",
+        "description": "Skill: explore the current level in one call. Walks to the nearest unexplored area again and again, opening doors, picking up gold and ignoring other things it walks over. Stops and says why when the level is explored, a monster appears or comes adjacent, HP drops, the level changes, or the game asks something. The result lists what was discovered.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "until": {"type": "string", "description": "Stop as soon as one of these is known: a target name (stairs_down, stairs_up, potion, ...) or a map symbol such as % or !."},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Most steps to take (default 300)."},
+                "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
+            },
+        },
+        "handler": tool_explore,
+    },
+    {
+        "name": "travel_to",
+        "description": "Skill: walk to a place by the cheapest known route, avoiding known traps. Give a target (the nearest one known is used) or x and y. Targets: stairs_down, stairs_up, dungeon_entrance, volcano, home, store, bank, college, trading_post, lrs, dealer, elevator, altar, fountain, throne, gold, potion, scroll, book, chest, or any map symbol such as ( or [. A prompt raised by the destination is left for you to answer. Stops early for the same reasons as explore.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "A target name or a one-character map symbol."},
+                "x": {"type": "integer", "description": "Map column, 0-66 (as in get_state's position)."},
+                "y": {"type": "integer", "description": "Map row, 0-16."},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Most steps to take (default 300)."},
+                "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
+            },
+        },
+        "handler": tool_travel_to,
+    },
+    {
+        "name": "take_stairs",
+        "description": "Skill: go to the known stairs and take them. In town, down means the dungeon entrance (or the volcanic shaft with volcano=true); on dungeon level 1, up means the exit to town. Returns not_found if the stairs have not been seen yet: use explore with until=stairs_down first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "enum": ["down", "up"], "description": "Default down."},
+                "volcano": {"type": "boolean", "description": "In town, climb down the volcanic shaft instead of entering the dungeon."},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000},
+                "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
+            },
+        },
+        "handler": tool_take_stairs,
+    },
+    {
+        "name": "fight",
+        "description": "Skill: attack the nearest visible monster, walking up to it if needed, and keep going until no monster is within reach. Stops with low_hp when HP falls to min_hp of the maximum, so you can flee, heal or cast instead. Melee only: it does not cast spells or use items.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "min_hp": {"type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "Stop when HP is at or below this fraction of maximum (default 0.35)."},
+                "reach": {"type": "integer", "minimum": 1, "maximum": 66, "description": "Only go after monsters within this many cells (default 5)."},
+                "max_turns": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Most attacks and steps (default 40)."},
+                "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
+            },
+        },
+        "handler": tool_fight,
+    },
+    {
+        "name": "flee",
+        "description": "Skill: step away from the visible monsters until none is within safe_distance. It looks one step ahead only, so it can end in a dead end (result cornered). To run to a specific place, such as the stairs, use travel_to or take_stairs instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "safe_distance": {"type": "integer", "minimum": 2, "maximum": 66, "description": "Stop once the nearest monster is this far away (default 8)."},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Most steps to take (default 20)."},
+                "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
+            },
+        },
+        "handler": tool_flee,
+    },
+    {
+        "name": "buy",
+        "description": "Skill: buy items at the DND store in town, walking there and going in if needed. Name items as the store lists them, e.g. 'chain mail' or 'potion of healing'; part of a name works if it matches one item. With no items it returns the store's price list for what is in stock. The result says what was bought, what was not and why.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {"type": "string"}, "description": "Items to buy, in order. Leave out to get the price list."},
+                "leave": {"type": "boolean", "description": "Leave the store afterwards (default true)."},
+                "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
+            },
+        },
+        "handler": tool_buy,
     },
     {
         "name": "summarize_run",
@@ -906,6 +1090,9 @@ class Server:
                                 "move / send_keys and read the returned screen.  When a live view is "
                                 "on, give each new_game / move / send_keys call a short `thought` "
                                 "saying what you are doing and why; viewers see it under the game."
+                                "  Prefer the skill tools (explore, travel_to, take_stairs, fight, "
+                                "flee, buy) to single keys: each does a whole errand in one call "
+                                "and stops, saying why, when something needs your decision."
                                 + ("  Games are recorded: call list_runs before a new game to learn "
                                    "from earlier ones, give new_game a `strategy` and `hypotheses`, "
                                    "and call summarize_run when the game is over."
