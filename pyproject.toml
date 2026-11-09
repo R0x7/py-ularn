@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyularn"
+version = "0.1.0"
+description = "Python port of the roguelike Ularn 1.6.3a, with an MCP server so AI agents can play"
+readme = "README.md"
+license = { text = "GPL-2.0-or-later" }
+requires-python = ">=3.10"
+dependencies = [
+    "windows-curses; sys_platform == 'win32'",
+]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment :: Role-Playing",
+    "Environment :: Console :: Curses",
+]
+
+[project.scripts]
+pyularn = "pyularn.__main__:main"
+pyularn-mcp = "pyularn.mcp_server:main"
+
+[tool.setuptools]
+packages = ["pyularn"]
+
+[tool.setuptools.package-data]
+pyularn = ["data/*"]
