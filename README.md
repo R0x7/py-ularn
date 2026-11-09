@@ -164,8 +164,15 @@ The sprite sheet `pyularn/data/ularn_gfx.png` is made from the original
 the transparency masks for the cursor and sparkle tiles, which the X11 code
 built at start-up. `data/gfx_guide.txt` lists what each tile is.
 
-## License
+## History, credits and license
 
-GPL-2.0, like Ularn itself; see [LICENSE](LICENSE) and
-[COPYRIGHT](COPYRIGHT). Original game © Julian Olds and the Larn/Ularn
-authors.
+Ularn is the work of Noah Morgan (Larn, 1986), Phil Cordier (Ularn), David
+Richerby, Josh Brandt and Josh Bressers (Ularn 1.5) and Julian Olds
+(Ularn 1.6). [HISTORY.md](HISTORY.md) gives the game's history, from
+[larn.org](https://larn.org/history/history), and a copyright note.
+
+This project claims no copyright in the game and is shared free and
+non-commercially only: Larn's original terms forbid making a profit from it.
+The 1.6 sources are released under the GPL v2 (see [LICENSE](LICENSE) and
+[COPYRIGHT](COPYRIGHT)), but larn.org notes that this does not lift Larn's
+no-profit condition; see [HISTORY.md](HISTORY.md#copyright).
