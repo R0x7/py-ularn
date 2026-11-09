@@ -27,6 +27,26 @@ Press `?` in the game for help. Move with `hjklyubn` (or the arrow keys).
 Capital letters run. Your daughter is dying of dianthroritis: find the potion
 that cures her and bring it home before time runs out.
 
+### With graphics
+
+```bash
+pyularn --web            # opens http://localhost:8765/ in your browser
+```
+
+This plays the same game in a web page, drawn with the original 32x32 sprite
+tiles from the X11/Windows versions of Ularn. A terminal cannot show
+sprites. The keyboard works as in the terminal. Arrow keys and
+Home/PgUp/End/PgDn move, and Ctrl+letter works too. **Tiles / Text**
+switches between the sprite map and the classic character screen. **Zoom**
+sets the tile size: when the map does not fit, it scrolls with the player,
+as in the X11 version.
+
+Options: `--web PORT` (`0` picks a free port), `--web-host 0.0.0.0` to play
+from another machine, and `--no-browser`. The usual Ularn options (`-d`,
+`-n`, ...) still work. Saves and scores are shared with the terminal
+version. The program ends when the game does, or press Ctrl+C in the
+terminal.
+
 ## MCP server
 
 `pyularn-mcp` (or `python -m pyularn.mcp_server`) runs a Model Context
@@ -70,8 +90,8 @@ Start the server with `--watch` (or set `PYULARN_WATCH=8765`) and open
 claude mcp add pyularn -- python -m pyularn.mcp_server --watch 8765
 ```
 
-The page redraws the game screen, in colour, each time the agent's input is
-handled. It also shows HP, spells, stats, inventory, active effects, known
+The page redraws the game, with the same sprite tiles as `pyularn --web`
+(or as text), each time the agent's input is handled. It also shows HP, spells, stats, inventory, active effects, known
 spells and the agent's recent keys. Playback can be **Live**, **Smooth**
 (10 frames/s) or **Slow** (4 frames/s), and you can pause it. The page is
 view-only, and `new_game` includes the address in its result. Use
@@ -131,7 +151,13 @@ python tests/fuzz.py deep 20 300    # fuzz every dungeon and volcano level
 | `action.py`, `show.py` | action.c, show.c | player commands, inventory display |
 | `store.py`, `scores.py`, `savegame.py`, `saveutils.py` | store.c, scores.c, savegame.c, saveutils.c | shops, the bank and college, scoreboard, save/restore |
 | `help.py`, `fortune.py`, `diag.py` | help.c, fortune.c, diag.c | help pages, fortunes, diagnostics |
-| `mcp_server.py`, `spectator.py`, `engine.py` | (new) | MCP server, live spectator page, engine reset |
+| `gfx.py` | ularn_winx11.c | sprite tile numbers for the map (the X11 `GetTile`) |
+| `mcp_server.py`, `spectator.py`, `web.py`, `engine.py` | (new) | MCP server, the web page (watching and `--web` play), engine reset |
+
+The sprite sheet `pyularn/data/ularn_gfx.png` is made from the original
+`data/ularn_gfx.xpm` by `tools/make_tiles.py`. That script also bakes in
+the transparency masks for the cursor and sparkle tiles, which the X11 code
+built at start-up. `data/gfx_guide.txt` lists what each tile is.
 
 ## License
 
