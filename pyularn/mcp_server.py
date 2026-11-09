@@ -19,6 +19,7 @@ import json
 import re
 import sys
 import threading
+import time
 import traceback
 
 from . import header
@@ -120,8 +121,25 @@ class GameSession:
         self.exit_code = None
         self.error = None
         self.lock = threading.Lock()
-        self.spectator = None   # pyularn.spectator.Spectator, if --watch
+        self.spectator = None   # pyularn.spectator.Spectator, once bound
+        self.watch = None       # (host, port) from --watch, bound lazily
+        self.watch_retry_at = 0.0
         self.game_id = 0
+
+    def ensure_spectator(self, force=False):
+        """Bind the --watch port if not bound yet.  Binding waits for the
+        first game, so an idle server (e.g. another session's) never holds
+        the port, and a failed bind is retried while the game runs."""
+        if self.spectator is not None or self.watch is None:
+            return self.spectator
+        now = time.monotonic()
+        if not force and now < self.watch_retry_at:
+            return None
+        self.watch_retry_at = now + 5
+        from . import spectator
+        host, port = self.watch
+        self.spectator = spectator.start(port, host)
+        return self.spectator
 
     # ----------------------------------------------------------- lifecycle
     @property
@@ -138,7 +156,8 @@ class GameSession:
         self.exit_code = None
         self.error = None
         self.game_id += 1
-        if self.spectator is not None:
+        self.ensure_spectator(force=True)
+        if self.spectator is not None or self.watch is not None:
             self.term.on_frame = self._on_frame
 
         def target():
@@ -158,6 +177,8 @@ class GameSession:
         from . import spectator
 
         if term is not self.term:  # a stale game shutting down
+            return
+        if self.ensure_spectator() is None:  # port still taken; retry later
             return
         try:
             state = self.state()
@@ -315,6 +336,9 @@ def tool_new_game(args):
     note = "New game started."
     if SESSION.spectator is not None:
         note += " Live view for the user: " + SESSION.spectator.url
+    elif SESSION.watch is not None:
+        note += (" Live view unavailable: port %d is in use (another pyularn "
+                 "server?); retrying every few seconds." % SESSION.watch[1])
     return _result(include_state=True, note=note)
 
 
@@ -540,8 +564,7 @@ def main(argv=None):
                     help="address for the spectator page (default 127.0.0.1)")
     args = ap.parse_args(argv)
     if args.watch is not None:
-        from . import spectator
-        SESSION.spectator = spectator.start(args.watch, args.watch_host)
+        SESSION.watch = (args.watch_host, args.watch)
 
     # The protocol owns stdout; anything the game might print goes to stderr.
     out = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="\n", line_buffering=True)
