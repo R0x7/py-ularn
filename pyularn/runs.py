@@ -186,7 +186,9 @@ def render_summary(meta, events):
             ("Seed", meta.get("seed")), ("Strategy", meta.get("strategy") or "none given"),
             ("Started", meta.get("started")), ("Actions", meta.get("actions"))]
     if out:
-        rows += [("Score", out.get("score")), ("Deepest level", deepest_text(out)),
+        prog = meta.get("progress") or {}
+        rows += [("Progress", "%s (%s)" % (prog.get("milestone"), prog.get("score")) if prog else None),
+                 ("Game score", out.get("score")), ("Deepest level", deepest_text(out)),
                  ("Character level", out.get("character_level")),
                  ("Time left", "%s mobuls" % out.get("mobuls_left"))]
     lines += ["| %s | %s |" % (k, "" if v is None else v) for k, v in rows]
@@ -272,6 +274,7 @@ def brief(meta):
         "result": out.get("result") or "in progress", "headline": headline(meta),
         "deepest": deepest_text(out) if out else None,
         "turns": out.get("turns"), "score": out.get("score"),
+        "progress": meta.get("progress"),
         "synopsis": notes.get("synopsis"), "next_try": notes.get("next_try") or [],
     }
 
@@ -298,14 +301,14 @@ def render_index(runs):
             _cell(diff), len(group), sum(1 for o in outs if o.get("won")), deepest_text(best)))
 
     lines += ["", "Newest first.", "",
-              "| Run | Class | Diff | Strategy | How it ended | Deepest | Score | Next run will try |",
+              "| Run | Class | Diff | Strategy | How it ended | Deepest | Progress | Next run will try |",
               "|---|---|---|---|---|---|---|---|"]
     for m in runs:
         b = brief(m)
         lines.append("| [%s](%s/summary.md) | %s | %s | %s | %s | %s | %s | %s |" % (
             b["run_id"], b["run_id"], _cell(b["character_class"]), _cell(b["difficulty"]),
-            _cell(b["strategy"]), _cell(b["headline"]), _cell(b["deepest"]), _cell(b["score"]),
-            _cell("; ".join(b["next_try"]))))
+            _cell(b["strategy"]), _cell(b["headline"]), _cell(b["deepest"]),
+            _cell((b["progress"] or {}).get("score")), _cell("; ".join(b["next_try"]))))
     return "\n".join(lines) + "\n"
 
 

@@ -302,7 +302,7 @@ class GameSession:
 
     def _progress(self):
         """How far the game got; shared by every kind of outcome."""
-        from . import player, dungeon
+        from . import player, dungeon, itm, potion
 
         c = player.c
         lev = dungeon.level
@@ -317,6 +317,9 @@ class GameSession:
             "mobuls_left": _mobuls_left(),
             "character_level": c[player.LEVEL],
             "experience": c[player.EXPERIENCE],
+            "has_cure": any(player.iven[i] == itm.OPOTION
+                            and player.ivenarg[i] == potion.PCUREDIANTH
+                            for i in range(player.IVENSIZE)),
         }
 
     def _death_outcome(self, Reason, Monster):
@@ -573,7 +576,31 @@ def _result(include_state=False, note=None):
     return "\n\n".join(parts)
 
 
+def _campaign_defaults(args):
+    """When `strategy` names a strategy of the campaign, the game takes its
+    hypotheses, character class and difficulty from there."""
+    from . import learn
+
+    sid = str(args.get("strategy") or "").strip()
+    if not sid or SESSION.record_dir is None:
+        return args
+    root = _runs_root()
+    if not learn.exists(root):
+        return args
+    campaign = learn.load(root)
+    if sid not in campaign["strategies"]:
+        return args
+    args = dict(args)
+    args["hypotheses"] = learn.changes(campaign, sid) or [campaign["strategies"][sid]["change"]]
+    args["difficulty"] = campaign["difficulty"]
+    cls = learn.character_class(campaign, sid)
+    if cls:
+        args["character_class"] = cls
+    return args
+
+
 def tool_new_game(args):
+    args = _campaign_defaults(args)
     cls = str(args.get("character_class", "") or "").strip().lower()
     cls = CLASSES.get(cls, cls)
     if cls and cls not in "abcdefgh":
@@ -728,6 +755,8 @@ def tool_summarize_run(args):
     runs.set_notes(path, synopsis, _string_list(args, "went_wrong"),
                    _string_list(args, "worked"), _string_list(args, "next_try"))
     runs.write_index(_runs_root())
+    from . import learn
+    learn.refresh(_runs_root())
     import os
     return "Post-mortem saved to " + os.path.join(path, "summary.md")
 
@@ -750,6 +779,48 @@ def tool_get_run(args):
     from . import runs
 
     return runs.write_summary(_run_path(args))
+
+
+# ----------------------------------------------------------------- learning
+
+def _learn(fn):
+    """Call into pyularn.learn, turning its errors into tool errors."""
+    from . import learn
+
+    try:
+        return fn(learn, _runs_root())
+    except learn.LearnError as e:
+        raise ToolError(str(e))
+
+
+def tool_get_briefing(args):
+    return _learn(lambda learn, root: learn.briefing(root))
+
+
+def tool_propose_strategy(args):
+    cls = str(args.get("character_class") or "").strip().lower()
+    if cls and cls not in CLASSES:
+        raise ToolError("character_class must be one of: " + ", ".join(CLASSES))
+    s = _learn(lambda learn, root: learn.propose(
+        root, args.get("title"), args.get("change"), parent=args.get("parent") or None,
+        character_class=cls or None))
+    return ("Strategy %s added under %s and set as the one to play next. "
+            "Start the next game with new_game(strategy=\"%s\")." % (s["id"], s["parent"], s["id"]))
+
+
+def tool_add_lesson(args):
+    lesson = _learn(lambda learn, root: learn.add_lesson(
+        root, args.get("text"), evidence=_string_list(args, "evidence"),
+        confidence=str(args.get("confidence") or "tentative")))
+    return "Lesson %s saved as %s, citing %d run%s." % (
+        lesson["id"], lesson["status"], len(lesson["evidence"]),
+        "" if len(lesson["evidence"]) == 1 else "s")
+
+
+def tool_retract_lesson(args):
+    lesson = _learn(lambda learn, root: learn.retract_lesson(
+        root, str(args.get("lesson_id") or "").strip(), args.get("reason")))
+    return "Lesson %s retracted." % lesson["id"]
 
 
 # ----------------------------------------------------------------- skills
@@ -1028,6 +1099,54 @@ TOOLS = [
         "handler": tool_list_runs,
     },
     {
+        "name": "get_briefing",
+        "description": "Read this before each game of a learning campaign. It names the strategy to play next and what it tests, lists the playbook's lessons, shows every strategy tried with how far each got, summarises the latest games, and sets out the steps of one cycle. Needs the server's --record option.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_get_briefing,
+    },
+    {
+        "name": "propose_strategy",
+        "description": "Add a strategy to test: an existing strategy plus ONE specific change, so the effect of that change can be seen by comparing the two. It becomes the strategy the next game plays.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "A short name, e.g. 'Armour before the dungeon'."},
+                "change": {"type": "string", "description": "The one thing it does differently from its parent, specific enough to follow, e.g. 'Sell the starting weapon and buy leather armor before entering the dungeon'."},
+                "parent": {"type": "string", "description": "The strategy id it builds on (default: the one played now)."},
+                "character_class": {"type": "string", "description": "Only if the change is to play another class: ogre, wizard, klingon, elf, rogue, adventurer, dwarf or rambo."},
+            },
+            "required": ["title", "change"],
+        },
+        "handler": tool_propose_strategy,
+    },
+    {
+        "name": "add_lesson",
+        "description": "Add a lesson to the playbook that every later game reads. Cite the runs that showed it. Use confidence 'confirmed' only when more than one run agrees; a lesson seen once is 'tentative'. Repeating an existing lesson adds your evidence to it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The lesson, as an instruction a later game can act on."},
+                "evidence": {"type": "array", "items": {"type": "string"}, "description": "Run ids that showed it."},
+                "confidence": {"type": "string", "enum": ["tentative", "confirmed"], "description": "Default tentative."},
+            },
+            "required": ["text"],
+        },
+        "handler": tool_add_lesson,
+    },
+    {
+        "name": "retract_lesson",
+        "description": "Mark a playbook lesson as wrong, with the reason. It stays on record, struck through, so it is not learned again by mistake.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lesson_id": {"type": "string", "description": "The lesson's id from the briefing, e.g. L3."},
+                "reason": {"type": "string", "description": "What showed it to be wrong."},
+            },
+            "required": ["lesson_id", "reason"],
+        },
+        "handler": tool_retract_lesson,
+    },
+    {
         "name": "get_run",
         "description": "Return the full summary of one recorded game: outcome, hypotheses, post-mortem, the route through the levels, lowest HP, final inventory, last thoughts and the final screen.",
         "inputSchema": {
@@ -1093,8 +1212,9 @@ class Server:
                                 "  Prefer the skill tools (explore, travel_to, take_stairs, fight, "
                                 "flee, buy) to single keys: each does a whole errand in one call "
                                 "and stops, saying why, when something needs your decision."
-                                + ("  Games are recorded: call list_runs before a new game to learn "
-                                   "from earlier ones, give new_game a `strategy` and `hypotheses`, "
+                                + ("  Games are recorded and learned from: call get_briefing "
+                                   "before a new game and follow the cycle it sets out (list_runs "
+                                   "and get_run show earlier games in full), "
                                    "and call summarize_run when the game is over."
                                    if SESSION.record_dir else "")
                                 + "\n\n" + KEY_REFERENCE,

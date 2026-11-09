@@ -127,6 +127,8 @@ class RunRecorder:
         for key in ("character_class", "difficulty"):
             if outcome.get(key) is not None:
                 self.meta[key] = outcome[key]
+        from . import learn, runs
+        self.meta["progress"] = learn.progress(outcome)
         self._write_meta()
-        from . import runs
-        runs.finish_run(self.dir)  # summary.md and INDEX.md
+        runs.finish_run(self.dir)                   # summary.md and INDEX.md
+        learn.refresh(os.path.dirname(self.dir))    # CAMPAIGN.md, if there is a campaign

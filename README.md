@@ -185,17 +185,66 @@ per difficulty.
 
 ### Learning from earlier games
 
-With `--record` on, the server asks agents to work in a loop:
+With `--record` on, the recordings folder also holds a campaign: what the
+games so far have learned, kept in `campaign.json` and written out for
+people as `CAMPAIGN.md`.
 
-1. `list_runs` (and `get_run` for the interesting ones) to read how earlier
-   games went and what they said to try next.
-2. `new_game` with a `strategy` name and the `hypotheses` this game tests.
-   Both are stored with the recording.
-3. Play.
-4. `summarize_run` with a `synopsis`, what `went_wrong`, what `worked` and
-   what the next game will try (`next_try`).
+- **Playbook.** Lessons, each citing the runs that showed it. A lesson is
+  `tentative` when seen once and `confirmed` when more than one run agrees.
+  A lesson found to be wrong is retracted, not deleted, so it is not
+  learned again by mistake.
+- **Strategy tree.** Every strategy is its parent plus one change, so the
+  effect of that change shows when the two are compared. The root, `S1`,
+  is a baseline with no fixed plan.
+- **Progress.** Wins are too rare to learn from at first, so each game is
+  scored on how far it got: 1 point per dungeon level, 2 per volcano level,
+  10 for holding the cure, 30 for winning. A strategy's results are worked
+  out from its recorded games and are never stored separately.
 
-The same information is available outside an agent:
+One cycle of the loop, which the server asks agents to follow:
+
+1. `get_briefing`: the strategy to play and what it tests, the playbook,
+   every strategy tried with how far each got, and the latest games.
+2. `new_game` with that `strategy`. The game takes its hypotheses, class
+   and difficulty from the strategy.
+3. Play to the end.
+4. `summarize_run`: a `synopsis`, what `went_wrong`, what `worked` and what
+   the next game will try (`next_try`).
+5. `add_lesson` for what the game showed (`retract_lesson` for a lesson it
+   disproved), and `propose_strategy` if there is one specific change worth
+   testing next.
+
+| Tool | What it does |
+|---|---|
+| `get_briefing` | What to read before a game; starts the campaign if there is none. |
+| `propose_strategy` | Add a strategy: `title`, the one `change`, optional `parent` and `character_class`. It is played next. |
+| `add_lesson` | Add a lesson: `text`, `evidence` (run ids), `confidence`. |
+| `retract_lesson` | Mark lesson `lesson_id` as wrong, with a `reason`. |
+
+#### Running the loop
+
+`pyularn-coach` plays a campaign without anyone at the keyboard. It starts
+one fresh agent per game and gives each the same short instruction: read
+the briefing and do one cycle. What carries over between games is the
+campaign folder, not the agent's memory.
+
+```bash
+pyularn-coach --dir runs --cycles 5 --max-budget-usd 3
+pyularn-coach --dir runs --status      # print the playbook and strategies
+```
+
+The agent is Claude Code in headless mode by default (`claude -p ...`, see
+`--print-command`). `--agent-cmd` swaps in any other command that can use
+an MCP server; `{prompt}` and `{mcp_config}` in it are replaced. Other
+options: `--model`, `--max-budget-usd` (a spending cap per game),
+`--timeout`, `--watch PORT` for the live page, and `--difficulty` for a new
+campaign.
+
+The coach gives each campaign its own scoreboard (`DIR/home`), writes each
+agent's output to `DIR/coach-logs/`, and stops when the game is won or when
+two cycles in a row fail to finish a game.
+
+The recordings are also readable outside an agent:
 
 ```bash
 pyularn-runs                 # list the runs in ./runs (or --dir DIR)
@@ -282,7 +331,7 @@ python tests/fuzz.py deep 20 300    # fuzz every dungeon and volcano level
 | `store.py`, `scores.py`, `savegame.py`, `saveutils.py` | store.c, scores.c, savegame.c, saveutils.c | shops, the bank and college, scoreboard, save/restore |
 | `help.py`, `fortune.py`, `diag.py` | help.c, fortune.c, diag.c | help pages, fortunes, diagnostics |
 | `gfx.py` | ularn_winx11.c | sprite tile numbers for the map (the X11 `GetTile`) |
-| `mcp_server.py`, `skills.py`, `recorder.py`, `runs.py`, `spectator.py`, `web.py`, `engine.py` | (new) | MCP server, multi-step skills for agents, game recordings, run summaries and index, the web page (watching and `--web` play), engine reset |
+| `mcp_server.py`, `skills.py`, `recorder.py`, `runs.py`, `learn.py`, `coach.py`, `spectator.py`, `web.py`, `engine.py` | (new) | MCP server, multi-step skills for agents, game recordings, run summaries and index, the playbook and strategy tree, the loop that runs a campaign, the web page (watching and `--web` play), engine reset |
 
 The sprite sheet `pyularn/data/ularn_gfx.png` is made from the original
 `data/ularn_gfx.xpm` by `tools/make_tiles.py`. That script also bakes in

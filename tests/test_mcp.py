@@ -68,7 +68,9 @@ class McpServerTest(unittest.TestCase):
         self.assertEqual(tools, {"new_game", "send_keys", "move", "get_screen",
                                  "get_state", "key_reference", "end_game",
                                  "summarize_run", "list_runs", "get_run",
-                                 "explore", "travel_to", "take_stairs", "fight", "flee", "buy"})
+                                 "explore", "travel_to", "take_stairs", "fight", "flee", "buy",
+                                 "get_briefing", "propose_strategy", "add_lesson",
+                                 "retract_lesson"})
         new_game = next(t for t in self.c.request("tools/list")["result"]["tools"]
                         if t["name"] == "new_game")
         self.assertIn("difficulty", new_game["inputSchema"]["properties"])
