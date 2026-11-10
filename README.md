@@ -344,6 +344,28 @@ can open `localhost` too.
 To see it without an AI client, `python examples/random_agent.py` starts the
 server with the page on and wanders the character around at random.
 
+### Replays on a static web site
+
+A recorded game can be turned into a replay that any static host (GitHub
+Pages, for one) can serve, with no server running:
+
+```bash
+python -m pyularn.replay SITE_DIR runs/20261110-072818-s1776500909 [more runs...]
+```
+
+The recording keeps the agent's calls, not every screen. Games are
+deterministic for a seed, so this plays the calls again and keeps every
+frame the live view would have shown, plus the agent's thoughts. After each
+call it checks the game against the state the recording saved. If they
+ever differ, it stops there and marks the replay as ending early. The
+player is named "Agent" rather than after your login.
+
+`SITE_DIR` gets `index.html` (the live view's page, playing from files, with
+a list of games and a seek bar), the tile sheet, and `runs/<run id>.json.gz`
+plus `runs/index.json`. Frames are stored as changes from the frame before,
+so a 600-call game is about 0.3 MB. Run the command again with more runs to
+add them to the list.
+
 ### How it works
 
 The unmodified game engine runs in a background thread on an in-memory
@@ -394,7 +416,7 @@ python tests/fuzz.py deep 20 300    # fuzz every dungeon and volcano level
 | `store.py`, `scores.py`, `savegame.py`, `saveutils.py` | store.c, scores.c, savegame.c, saveutils.c | shops, the bank and college, scoreboard, save/restore |
 | `help.py`, `fortune.py`, `diag.py` | help.c, fortune.c, diag.c | help pages, fortunes, diagnostics |
 | `gfx.py` | ularn_winx11.c | sprite tile numbers for the map (the X11 `GetTile`) |
-| `mcp_server.py`, `skills.py`, `recorder.py`, `runs.py`, `learn.py`, `coach.py`, `spectator.py`, `web.py`, `engine.py` | (new) | MCP server, multi-step skills for agents, game recordings, run summaries and index, the playbook and strategy tree, the loop that runs a campaign, the web page (watching and `--web` play), engine reset |
+| `mcp_server.py`, `skills.py`, `recorder.py`, `runs.py`, `learn.py`, `coach.py`, `spectator.py`, `web.py`, `replay.py`, `engine.py` | (new) | MCP server, multi-step skills for agents, game recordings, run summaries and index, the playbook and strategy tree, the loop that runs a campaign, the web page (watching and `--web` play), static web replays of recorded games, engine reset |
 
 The sprite sheet `pyularn/data/ularn_gfx.png` is made from the original
 `data/ularn_gfx.xpm` by `tools/make_tiles.py`. That script also bakes in
