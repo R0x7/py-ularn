@@ -157,6 +157,7 @@ class GameSession:
         self.waiting = None     # what the game is waiting for; see _hook_input
         self.quiet = 0          # game calls in a row without a thought (live view on)
         self.nudge_due = False  # the next result reminds the agent to narrate
+        self.item_snap = None   # pyularn.items.snapshot() after the last action
 
     def ensure_spectator(self, force=False):
         """Bind the --watch port if not bound yet.  Binding waits for the
@@ -399,10 +400,59 @@ class GameSession:
         except OSError:
             traceback.print_exc(file=sys.stderr)
             self.recorder = None
+        self.item_snap = None
+        self.observe_items()
+
+    def observe_items(self, tool=None, result=None):
+        """Add what the last action showed about items to the item book:
+        WC/AC when something was wielded or worn, prices in town, items
+        lying on dungeon levels.  See pyularn.items."""
+        if self.record_dir is None or self.term is None or self.error:
+            return
+        from . import items
+
+        try:
+            after = items.snapshot()
+            obs = items.diff(self.item_snap, after, prices=tool != "buy")
+            if tool == "buy" and isinstance(result, dict):
+                # The buy skill knows each price, even when it bought several things.
+                obs += [{"type": "price", "item": items.plain(b["name"]), "plus": None,
+                         "way": "bought", "price": b["price"]}
+                        for b in result.get("bought") or ()]
+            self.item_snap = after
+            if obs:
+                root = _runs_root()
+                book = items.load(root)
+                run_id = self.recorder.run_id if self.recorder is not None else None
+                if items.record(book, obs, run_id):
+                    items.save(root, book)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
+    def item_facts(self, state):
+        """What the item book says about the items in the pack and in sight."""
+        if self.record_dir is None:
+            return {}
+        from . import items
+
+        try:
+            book = items.load(_runs_root())
+            if not book["items"]:
+                return {}
+            names = [items.plain(o["name"]) for o in state.get("objects", ())]
+            from . import itm, player
+            names += [items.kind_of(player.iven[i], player.ivenarg[i])
+                      for i in range(player.IVENSIZE) if player.iven[i] != itm.ONOTHING]
+            names = [n for n in names if n]
+            return items.facts(book, dict.fromkeys(names))
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            return {}
 
     def record_action(self, tool, args, thought=None, result=None):
         """Log a tool call after the game handled it, and close the log once
         the game is over."""
+        self.observe_items(tool, result)
         rec = self.recorder
         if rec is None or rec.closed:
             return
@@ -505,6 +555,9 @@ class GameSession:
         st["monsters"] = _visible_monsters()
         from . import skills
         st["objects"] = skills.known_objects(1000)
+        known = self.item_facts(st)
+        if known:
+            st["item_book"] = known
         st["input"] = self.input_state()
         on_map = ularn_win.CurrentDisplayMode == ularn_win.DISPLAY_MAP
         st["display"] = "map" if on_map else "text"
@@ -890,6 +943,35 @@ def tool_retract_lesson(args):
     return "Lesson %s retracted." % lesson["id"]
 
 
+def _items(fn):
+    """Call into pyularn.items, turning its errors into tool errors."""
+    from . import items
+
+    try:
+        return fn(items, _runs_root())
+    except items.ItemError as e:
+        raise ToolError(str(e))
+
+
+def tool_note_item(args):
+    name, note = _items(lambda items, root: items.add_note(
+        root, args.get("item"), args.get("text"), evidence=_string_list(args, "evidence"),
+        confidence=str(args.get("confidence") or "tentative")))
+    return "Note %s on %s saved as %s, citing %d run%s." % (
+        note["id"], name, note["status"], len(note["evidence"]),
+        "" if len(note["evidence"]) == 1 else "s")
+
+
+def tool_retract_item_note(args):
+    name, note = _items(lambda items, root: items.retract_note(
+        root, str(args.get("note_id") or "").strip(), args.get("reason")))
+    return "Note %s on %s retracted." % (note["id"], name)
+
+
+def tool_get_items(args):
+    return _items(lambda items, root: items.lookup(items.load(root), args.get("item")))
+
+
 # ----------------------------------------------------------------- skills
 
 def _int_arg(args, name, default, low, high):
@@ -1215,6 +1297,45 @@ TOOLS = [
         "handler": tool_retract_lesson,
     },
     {
+        "name": "get_items",
+        "description": "Read the item book: what earlier games found out about items. The server measures some of it as you play (the WC or AC an item gives when you wield or wear it, prices paid and fetched in town, the levels items were found on); the rest are notes agents wrote with note_item. get_state's item_book shows the entries for what you carry and can see. Needs the server's --record option.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item": {"type": "string", "description": "Only items whose name contains this, e.g. 'mail' or 'potion of healing'. Default: the whole book."},
+            },
+        },
+        "handler": tool_get_items,
+    },
+    {
+        "name": "note_item",
+        "description": "Add a note about an item to the item book, which later games see in get_state and the briefing: what it does, when it is worth using, buying or selling, and what goes wrong with it. Cite the runs that showed it; 'confirmed' needs two or more. Write what holds for that kind of item in any game, not where one lay. Repeating a note adds your evidence to it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item": {"type": "string", "description": "The item, e.g. 'leather armor', 'potion of healing', 'scroll of teleportation'. Part of a name is enough if it matches one item."},
+                "text": {"type": "string", "description": "The note, as something a later game can act on."},
+                "evidence": {"type": "array", "items": {"type": "string"}, "description": "Run ids that showed it (the game in progress counts)."},
+                "confidence": {"type": "string", "enum": ["tentative", "confirmed"], "description": "Default tentative."},
+            },
+            "required": ["item", "text"],
+        },
+        "handler": tool_note_item,
+    },
+    {
+        "name": "retract_item_note",
+        "description": "Mark an item note as wrong, with the reason. It stays on record, struck through.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "note_id": {"type": "string", "description": "The note's id, e.g. I4."},
+                "reason": {"type": "string", "description": "What showed it to be wrong."},
+            },
+            "required": ["note_id", "reason"],
+        },
+        "handler": tool_retract_item_note,
+    },
+    {
         "name": "get_run",
         "description": "Return the full summary of one recorded game: outcome, hypotheses, post-mortem, the route through the levels, lowest HP, final inventory, last thoughts and the final screen.",
         "inputSchema": {
@@ -1283,7 +1404,9 @@ class Server:
                                 + ("  Games are recorded and learned from: call get_briefing "
                                    "before a new game and follow the cycle it sets out (list_runs "
                                    "and get_run show earlier games in full), "
-                                   "and call summarize_run when the game is over."
+                                   "and call summarize_run when the game is over.  Items have "
+                                   "a book of their own: get_state's item_book and get_items "
+                                   "show what earlier games learned, and note_item adds to it."
                                    if SESSION.record_dir else "")
                                 + "\n\n" + KEY_REFERENCE,
             }

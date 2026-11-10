@@ -715,6 +715,10 @@ CYCLE_STEPS = """\
    If a lesson in the playbook turned out wrong, call `retract_lesson`.
    Lessons must hold in any dungeon: the same seeds are played again, so
    never record where things are on a particular map.
+   What you found out about a particular item (what it does, whether it
+   was worth the gold, how it went wrong) goes in the item book instead:
+   call `note_item`. Its WC/AC, prices and where it turns up are measured
+   for you; to measure an item, wield or wear it.
 5. If you have one specific change that should do better, call
    `propose_strategy` with it. One change at a time, so its effect can be
    seen. It waits its turn; you do not need to propose one every game.
@@ -771,6 +775,8 @@ def briefing(root):
         lines += ["Tentative, seen once:", ""] + tentative + [""]
     if not confirmed and not tentative:
         lines += ["_Empty: this is one of the first games._", ""]
+    from . import items
+    lines += items.briefing_lines(items.load(root))
 
     lines += ["## Strategies", "", _rules_text(campaign), ""] + _tree_lines(campaign, st, sid)
     failed = _failed_lines(campaign)

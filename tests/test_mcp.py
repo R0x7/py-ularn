@@ -70,7 +70,8 @@ class McpServerTest(unittest.TestCase):
                                  "summarize_run", "list_runs", "get_run",
                                  "explore", "travel_to", "take_stairs", "fight", "flee", "buy",
                                  "get_briefing", "propose_strategy", "add_lesson",
-                                 "retract_lesson"})
+                                 "retract_lesson", "get_items", "note_item",
+                                 "retract_item_note"})
         new_game = next(t for t in self.c.request("tools/list")["result"]["tools"]
                         if t["name"] == "new_game")
         self.assertIn("difficulty", new_game["inputSchema"]["properties"])
