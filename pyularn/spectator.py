@@ -482,8 +482,17 @@ document.title = CONFIG.play ? "Ularn" : "Ularn live";
 $("title").textContent = CONFIG.play ? "" : "live";
 if (CONFIG.play) { document.body.classList.add("play"); $("speed").value = "0"; }
 
+// The tile sheet.  Until it has loaded the map is shown as text; a failed
+// load (a busy static host answers 503 now and then) is tried again.
 const sheet = new Image();
+let sheetTries = 0;
+const sheetReady = () => sheet.complete && sheet.naturalWidth > 0;
 sheet.onload = () => { if (current) render(current, true); };
+sheet.onerror = () => {
+  sheetTries++;
+  setTimeout(() => { sheet.src = "ularn_gfx.png?try=" + sheetTries; },
+             Math.min(30000, 1000 * 2 ** Math.min(sheetTries, 5)));
+};
 sheet.src = "ularn_gfx.png";
 
 function esc(s) { return s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
@@ -531,7 +540,7 @@ function drawMap(m) {
   const ctx = cv.getContext("2d");
   ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
-  if (!sheet.complete || !sheet.naturalWidth) return;
+  if (!sheetReady()) return;
   const edge = i => Math.round(i * ts * dpr);
   const put = (tile, sx, sy) => {
     const x0 = edge(sx), y0 = edge(sy);
@@ -557,7 +566,7 @@ function render(f, redraw) {
     if (f.game !== lastGame) { keys = []; lastGame = f.game; }
     if (f.key) { keys.push(f.key); if (keys.length > 24) keys.shift(); }
   }
-  const tiles = view === "tiles" && f.map;
+  const tiles = view === "tiles" && f.map && sheetReady();
   $("mapwrap").classList.toggle("on", !!tiles);
   if (tiles) { drawMap(f.map); drawScreen(f.rows.slice(MAP_ROWS)); }
   else drawScreen(f.rows);
