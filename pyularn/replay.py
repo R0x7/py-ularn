@@ -282,7 +282,13 @@ PLAYER_HTML = r"""<section id="picker" aria-label="Recorded games">
 PLAYER_JS = r"""// ---- replays: load a recorded game from a file instead of a live server
 let frames = [], at = 0;
 async function fetchJson(url) {
-  const res = await fetch(url);
+  // A busy static host answers 5xx now and then: try a few times.
+  let res;
+  for (let tries = 0; ; tries++) {
+    res = await fetch(url);
+    if (res.ok || res.status < 500 || tries >= 3) break;
+    await new Promise(r => setTimeout(r, 1000 * 2 ** tries));
+  }
   if (!res.ok) throw new Error(res.status + " " + url);
   if (!url.endsWith(".gz")) return res.json();
   // The file is plain gzip (Pages serves it as is), so unpack it here.
