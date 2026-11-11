@@ -14,8 +14,8 @@ Event types in ``events.jsonl``:
 ``start``   the full player state when the game began
 ``action``  one tool call: the tool, its arguments, the agent's `thought`
             and a compact state (`s`) after the game handled it
-``state``   the full player state, written when the dungeon level changes
-            and every `STATE_EVERY` actions
+``state``   the full player state, written when the dungeon level changes,
+            when the cure is taken, and every `STATE_EVERY` actions
 ``error``   a tool call the server refused or that failed: the tool, its
             arguments and the message the agent got.  The game did not move
 ``end``     the outcome, the final full state and the last `TAIL_SCREENS`
@@ -79,6 +79,7 @@ class RunRecorder:
         self.errors = 0
         self.closed = False
         self._level = state.get("level_index")
+        self._cure = False
         self._tail = collections.deque(maxlen=TAIL_SCREENS)
         self._events = open(os.path.join(self.dir, "events.jsonl"), "w",
                             encoding="utf-8", newline="\n")
@@ -114,8 +115,11 @@ class RunRecorder:
         self._event("action", **ev)
         self._tail.append({"n": self.actions, "turn": state.get("turns"), "screen": screen})
         level = state.get("level_index")
-        if level != self._level or self.actions % STATE_EVERY == 0:
-            self._level = level
+        # A full state too at the moment the cure is taken (or lost), so a
+        # run sheet can say exactly when.
+        cure = any("cure dianthroritis" in line for line in state.get("inventory") or ())
+        if level != self._level or cure != self._cure or self.actions % STATE_EVERY == 0:
+            self._level, self._cure = level, cure
             self._event("state", n=self.actions, state=state)
 
     def error(self, tool, args, message, turn=None):

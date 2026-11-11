@@ -36,8 +36,10 @@ ESC = "\x1b"
 # targets until HP fell to min_hp.  Version 2 still stopped a walk for
 # every monster in view, however far or walled off, and at every step
 # taken next to one; it did not look for a forgotten building in town.
-# Version 3 had `flee` look one step ahead only.
-VERSION = 4
+# Version 3 had `flee` look one step ahead only.  Version 4 took "In What
+# Direction?" for the map waiting for a command, so a skill started there
+# answered the question with its first key.
+VERSION = 5
 BEHAVE = VERSION     # the version whose behaviour is in force; see behave_as
 LEGACY = False       # behaving as a version before 3
 
@@ -405,7 +407,11 @@ class Runner:
     def kind(self):
         """What the game is waiting for: "command", "prompt" or "other"."""
         w = self.s.waiting
-        return w["kind"] if w else "other"
+        if not w:
+            return "other"
+        if w.get("direction") and BEHAVE < 5:
+            return "command"    # as it was: a direction is read like a command
+        return w["kind"]
 
     def answers(self):
         w = self.s.waiting
@@ -1027,6 +1033,29 @@ def pick_up(session, target=None, x=None, y=None, max_steps=300, ignore_monsters
     return r.report(result, **out)
 
 
+# Timed effects the game announces when they start but does not list beside
+# the map: player.c[] name, and the name agents are given.
+UNLISTED_EFFECTS = (
+    ("BLINDCOUNT", "Blind"), ("CONFUSE", "Confused"), ("AGGRAVATE", "Aggravate"),
+    ("HASTEMONST", "Haste Monsters"), ("ITCHING", "Itching"), ("CLUMSINESS", "Clumsy"),
+    ("SEEINVISIBLE", "See Invisible"), ("HERO", "Heroism"), ("GLOBE", "Invulnerability"),
+    ("HALFDAM", "Half Damage"), ("AWARENESS", "Awareness"),
+)
+
+
+def _effects():
+    """(player.c[] index, name) of every timed effect: those the game lists
+    beside the map, under the names it uses there, then the unlisted ones."""
+    listed = [(e.typ, e.string.strip()) for e in E.ularn_win._get_bot_data()]
+    return listed + [(getattr(E.player, n), name) for n, name in UNLISTED_EFFECTS]
+
+
+def active_effects():
+    """Names of the timed effects now running."""
+    c = E.player.c
+    return [name for idx, name in _effects() if c[idx]]
+
+
 def _pack_has_room():
     """Whether the game would let you take one more thing: the slots it
     lets you use grow with your level (see player.take)."""
@@ -1035,23 +1064,37 @@ def _pack_has_room():
     return any(player.iven[i] == E.itm.ONOTHING for i in range(slots))
 
 
-def rest(session, turns=None, until="hp", max_turns=200, ignore_monsters=False):
+def rest(session, turns=None, until="hp", max_turns=200, ignore_monsters=False, effect=None):
     """Wait a turn at a time, watching for trouble.
 
     Without `turns`, rests until HP is full (`until` "hp"), spell points
     are (`until` "spells"), or both are (`until` "both"), for at most
-    `max_turns`.  With `turns`, waits that many turns whatever HP is, to
-    let an effect wear off, say.  It stops at once when HP drops or a
+    `max_turns`.  With `turns`, waits that many turns whatever HP is.  With
+    `effect`, the name of a timed effect as get_state lists it ("Time
+    Stop", "Hold Monst", "Stealth"...), waits until that effect has ended,
+    for at most `max_turns` waits.  It stops at once when HP drops or a
     monster comes into view or next to you, and it will not rest on a
     known trap that fires every turn: it steps off first.  It can be used
     while blind or confused.  Results: rested (nothing left to recover),
-    waited (the `turns` asked for have passed), max_turns, blocked (on a
-    trap with nowhere to step), plus the interruptions of travel_to.
+    waited (the `turns` asked for have passed), effect_ended, max_turns,
+    blocked (on a trap with nowhere to step), plus the interruptions of
+    travel_to.  "turns" in the report is game time, which stands still
+    during a time stop; "steps" is how many times it waited.
     """
     player = E.player
     c = player.c
     if until not in ("hp", "spells", "both"):
         raise SkillError("until must be hp, spells or both")
+    wanted = None
+    if effect is not None:
+        if turns is not None:
+            raise SkillError("give turns or effect, not both")
+        effects = _effects()
+        key = " ".join(str(effect).lower().split())
+        wanted = next((e for e in effects if e[1].lower() == key), None)
+        if wanted is None:
+            raise SkillError("no effect is called %r. The effects are: %s"
+                             % (effect, ", ".join(name for _, name in effects)))
     r = Runner(session)
     r.check_ready(impaired=True)
 
@@ -1067,10 +1110,15 @@ def rest(session, turns=None, until="hp", max_turns=200, ignore_monsters=False):
         if not r.over():
             out.update(hp_gained=c[player.HP] - hp, spells=c[player.SPELLS],
                        spells_max=c[player.SPELLMAX], spells_gained=c[player.SPELLS] - spells)
+        if wanted is not None:
+            out["effect"] = wanted[1]
         out.update(extra)
         return r.report(result, **out)
 
-    if turns is None and not lacking():
+    if wanted is not None:
+        if not c[wanted[0]]:
+            return done("effect_ended", note="that effect is not running")
+    elif turns is None and not lacking():
         return done("rested", note="nothing to recover")
     if seen(*r.pos()) in trap_ids():
         trap = r.pos()
@@ -1100,7 +1148,11 @@ def rest(session, turns=None, until="hp", max_turns=200, ignore_monsters=False):
         if why:
             result = why
             break
-        if turns is None and not lacking():
+        if wanted is not None:
+            if not c[wanted[0]]:
+                result = "effect_ended"
+                break
+        elif turns is None and not lacking():
             result = "rested"
             break
     return done(result)

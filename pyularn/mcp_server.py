@@ -118,6 +118,7 @@ def parse_keys(text):
 
 MAX_THOUGHT = 2000
 MESSAGE_ROW = 19   # screen rows: 0-16 the map, 17-18 status, 19-23 messages
+DIRECTION_KEYS = "hjklyubn"   # what "In What Direction?" takes; nothing else ends it
 
 THOUGHT_SCHEMA = {
     "type": "string",
@@ -357,13 +358,20 @@ class GameSession:
 
         self.waiting = None
 
-        def wrap(name, kind):
+        def wrap(name, kind, answers=None):
             original = getattr(ularn_win, name)
 
             def wrapper(*args, **kwargs):
                 previous = self.waiting
-                self.waiting = {"kind": kind,
-                                "answers": args[1] if kind == "prompt" and len(args) > 1 else None}
+                if previous and previous.get("direction"):
+                    # "In What Direction?" reads its key as a command is
+                    # read, but it is still that question being asked.
+                    return original(*args, **kwargs)
+                self.waiting = {"kind": kind, "answers": answers}
+                if kind == "prompt" and answers is None and len(args) > 1:
+                    self.waiting["answers"] = args[1]
+                if name == "get_dir_input":
+                    self.waiting["direction"] = True
                 try:
                     return original(*args, **kwargs)
                 finally:
@@ -373,6 +381,7 @@ class GameSession:
 
         wrap("get_normal_input", "command")
         wrap("get_prompt_input", "prompt")
+        wrap("get_dir_input", "prompt", DIRECTION_KEYS)
 
     def input_state(self):
         """What the next key will be read as, for agents."""
@@ -599,7 +608,7 @@ class GameSession:
     def state(self):
         """Structured snapshot of the player.  Only valid while the game
         thread is blocked waiting for input (or finished)."""
-        from . import player, dungeon, itm, show, spell, ularn_game, ularn_win
+        from . import player, dungeon, itm, show, skills, spell, ularn_game, ularn_win
 
         c = player.c
         lev = dungeon.level
@@ -636,15 +645,7 @@ class GameSession:
                 inv.append(text)
         st["inventory"] = inv
 
-        effects = []
-        for e in ularn_win._get_bot_data():
-            if c[e.typ]:
-                effects.append(e.string.strip())
-        for idx, name in ((player.BLINDCOUNT, "Blind"), (player.CONFUSE, "Confused"),
-                          (player.AGGRAVATE, "Aggravate")):
-            if c[idx]:
-                effects.append(name)
-        st["effects"] = effects
+        st["effects"] = skills.active_effects()
         st["attacked_by"] = self.recent_attacks()
 
         st["known_spells"] = [
@@ -652,7 +653,6 @@ class GameSession:
             for i in range(spell.SPELL_COUNT) if player.spelknow[i]
         ]
         st["monsters"] = _visible_monsters()
-        from . import skills
         st["objects"] = skills.known_objects(1000)
         known = self.item_facts(st)
         if known:
@@ -749,7 +749,18 @@ def _campaign_defaults(args):
         return args
     campaign = learn.load(root)
     if sid not in campaign["strategies"]:
-        return args
+        # "S1 Baseline" for S1 is a slip, and the game should still count
+        # for S1.  Any other name is a game outside the campaign: say so,
+        # since such a game is in no strategy's results or notes.
+        m = re.match(r"(S\d+)\b", sid, re.IGNORECASE)
+        if m and m.group(1).upper() in campaign["strategies"]:
+            args = dict(args, strategy=m.group(1).upper())
+            sid = args["strategy"]
+        else:
+            return dict(args, _strategy_note=(
+                " \"%s\" is not a strategy of the campaign (%s), so this game counts "
+                "towards none of them." % (sid, ", ".join(sorted(
+                    campaign["strategies"], key=lambda s: int(s[1:]))))))
     args = dict(args)
     args["_campaign_root"] = root
     args["hypotheses"] = learn.changes(campaign, sid) or [campaign["strategies"][sid]["change"]]
@@ -831,7 +842,7 @@ def tool_new_game(args):
                 SESSION.send("\r")
             else:
                 break
-    note = "New game started."
+    note = "New game started." + (args.get("_strategy_note") or "")
     if difficulty is not None and not SESSION.error:
         from . import player
         actual = player.c[player.HARDGAME]
@@ -1002,13 +1013,42 @@ def tool_summarize_run(args):
     path = _run_path(args)
     if runs.load_meta(path).get("outcome") is None:
         raise ToolError("That game is still in progress. Finish it or call end_game first.")
+    takeaway = " ".join(str(args.get("takeaway") or "").split())
+    if len(takeaway) > runs.TAKEAWAY_MAX:
+        raise ToolError("takeaway is one sentence, at most %d characters; this is %d"
+                        % (runs.TAKEAWAY_MAX, len(takeaway)))
     runs.set_notes(path, synopsis, _string_list(args, "went_wrong"),
-                   _string_list(args, "worked"), _string_list(args, "next_try"))
-    runs.write_index(_runs_root())
+                   _string_list(args, "worked"), _string_list(args, "next_try"),
+                   takeaway=takeaway)
+    root = _runs_root()
+    runs.write_index(root)
     from . import learn
-    learn.refresh(_runs_root())
+    learn.refresh(root)
     import os
-    return "Post-mortem saved to " + os.path.join(path, "summary.md")
+    text = "Post-mortem saved to " + os.path.join(path, "summary.md")
+    if not takeaway:
+        text += ("\nNo takeaway was given, so lists will show the first thing that went wrong. "
+                 "Call summarize_run again with a one-sentence takeaway to set one.")
+    # The game is on record; now the strategy's own account needs it too.
+    meta = runs.load_meta(path)
+    meta.setdefault("run_id", os.path.basename(path))
+    sid = meta.get("strategy")
+    if learn.exists(root):
+        campaign = learn.load(root)
+        line = learn.line_of(campaign, meta)
+        if line is not None:
+            # A win, or a game that followed one: the account to write is the recipe.
+            text += "\n" + learn.recipe_prompt(root, campaign, line, meta)
+        elif sid in campaign["strategies"]:
+            notes = campaign["strategies"][sid].get("notes")
+            text += ("\n\nNow bring the field notes of %s up to date with note_strategy "
+                     "(strategy \"%s\", at most %d characters). They are what the next agent "
+                     "reads in place of this game and the ones before it: how the strategy "
+                     "plays, how it dies, what to do differently. Rewrite them whole.\n\n"
+                     % (sid, sid, learn.NOTES_MAX))
+            text += ("The notes as they stand:\n\n" + notes["text"] if notes
+                     else "There are none yet: yours will be the first.")
+    return text
 
 
 def tool_list_runs(args):
@@ -1021,8 +1061,9 @@ def tool_list_runs(args):
     for key in ("difficulty", "strategy"):
         if args.get(key) is not None:
             found = [m for m in found if m.get(key) == args[key]]
+    full = _bool_arg(args, "full")
     return json.dumps({"total": len(found),
-                       "runs": [runs.brief(m) for m in found[:limit]]}, indent=1)
+                       "runs": [runs.brief(m, full=full) for m in found[:limit]]}, indent=1)
 
 
 def tool_get_run(args):
@@ -1066,19 +1107,24 @@ def _pages(text, size=BRIEFING_PAGE):
     return pages or [""]
 
 
-def tool_get_briefing(args):
-    pages = _pages(_learn(lambda learn, root: learn.briefing(root)))
-    page = _int_arg(args, "page", 1, 1, 1000)
+def _page(pages, page, what, tool, before="before you play"):
+    """One page of a long text, headed by which page it is and how to get the next."""
     if page > len(pages):
-        raise ToolError("the briefing has %d page%s" % (len(pages), "" if len(pages) == 1 else "s"))
+        raise ToolError("the %s has %d page%s" % (what.lower(), len(pages),
+                                                  "" if len(pages) == 1 else "s"))
     if len(pages) == 1:
         return pages[0]
-    head = "[Briefing, page %d of %d." % (page, len(pages))
+    head = "[%s, page %d of %d." % (what, page, len(pages))
     if page < len(pages):
-        head += " Read every page before you play: next, get_briefing with page=%d.]" % (page + 1)
+        head += " Read every page %s: next, %s with page=%d.]" % (before, tool, page + 1)
     else:
         head += " This is the last page.]"
     return head + "\n\n" + pages[page - 1]
+
+
+def tool_get_briefing(args):
+    pages = _pages(_learn(lambda learn, root: learn.briefing(root)))
+    return _page(pages, _int_arg(args, "page", 1, 1, 1000), "Briefing", "get_briefing")
 
 
 def tool_propose_strategy(args):
@@ -1103,13 +1149,85 @@ def tool_propose_strategy(args):
     return text
 
 
+def _over_budget(learn, root):
+    """A line for the agent when the playbook has outgrown its budget."""
+    campaign = learn.load(root)
+    size, budget = learn.playbook_size(campaign), campaign["rules"]["playbook_budget"]
+    if size <= budget:
+        return ""
+    return (" The playbook is now %d characters, over its budget of %d: fold overlapping "
+            "lessons together with merge_lessons." % (size, budget))
+
+
 def tool_add_lesson(args):
     lesson = _learn(lambda learn, root: learn.add_lesson(
         root, args.get("text"), evidence=_string_list(args, "evidence"),
-        confidence=str(args.get("confidence") or "tentative")))
-    return "Lesson %s saved as %s, citing %d run%s." % (
-        lesson["id"], lesson["status"], len(lesson["evidence"]),
-        "" if len(lesson["evidence"]) == 1 else "s")
+        confidence=str(args.get("confidence") or "tentative"), topic=args.get("topic")))
+    return "Lesson %s saved as %s under \"%s\", citing %d run%s.%s" % (
+        lesson["id"], lesson["status"], lesson.get("topic"), len(lesson["evidence"]),
+        "" if len(lesson["evidence"]) == 1 else "s", _learn(_over_budget))
+
+
+def tool_merge_lessons(args):
+    ids = args.get("lesson_ids")
+    if isinstance(ids, str):
+        ids = [i for i in re.split(r"[\s,]+", ids) if i]
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        raise ToolError("lesson_ids must be a list of lesson ids, e.g. [\"L3\", \"L8\"]")
+    lesson, saved = _learn(lambda learn, root: learn.merge_lessons(
+        root, ids, args.get("text"), topic=args.get("topic")))
+    return "Lesson %s (%s, under \"%s\", citing %d run%s) replaces %s. The playbook is %d " \
+           "characters %s.%s" % (
+               lesson["id"], lesson["status"], lesson["topic"], len(lesson["evidence"]),
+               "" if len(lesson["evidence"]) == 1 else "s", ", ".join(ids), abs(saved),
+               "shorter" if saved >= 0 else "longer", _learn(_over_budget))
+
+
+def tool_get_lessons(args):
+    pages = _pages(_learn(lambda learn, root: learn.lessons_text(root, args.get("about"))))
+    return _page(pages, _int_arg(args, "page", 1, 1, 1000), "Playbook", "get_lessons",
+                 before="to see all of it")
+
+
+def tool_get_strategy(args):
+    sid = str(args.get("strategy") or "").strip()
+    return _learn(lambda learn, root: learn.strategy_report(root, sid))
+
+
+def tool_write_recipe(args):
+    sid = str(args.get("strategy") or "").strip()
+    run_id = args.get("run_id")
+    rec = SESSION.recorder
+
+    def write(learn, root):
+        nonlocal sid, run_id
+        if rec is not None:
+            # This session's game: the line made from it, or the line it followed.
+            line = learn.line_of(learn.load(root), rec.meta)
+            if line is not None and sid in ("", line["id"]):
+                sid = line["id"]
+                run_id = run_id or rec.run_id
+        if not sid:
+            raise learn.LearnError(
+                "name the strategy: a winning line from the briefing. There is one only once "
+                "a game has been won.")
+        return learn.write_recipe(root, sid, args.get("text"), run_id)
+
+    s = _learn(write)
+    return "Recipe of %s %s saved (%d characters). It is what the next game under %s plays from." % (
+        s["id"], s["title"], len(s["recipe"]["text"]), s["id"])
+
+
+def tool_note_strategy(args):
+    sid = str(args.get("strategy") or "").strip()
+    run_id = args.get("run_id")
+    if run_id is None and SESSION.recorder is not None \
+            and SESSION.recorder.meta.get("strategy") == sid:
+        run_id = SESSION.recorder.run_id        # the game this session just played under it
+    s = _learn(lambda learn, root: learn.note_strategy(root, sid, args.get("text"), run_id))
+    return "Field notes of %s %s saved (%d characters), covering %d game%s." % (
+        s["id"], s["title"], len(s["notes"]["text"]), s["notes"]["games"],
+        "" if s["notes"]["games"] == 1 else "s")
 
 
 def tool_retract_lesson(args):
@@ -1261,14 +1379,21 @@ def _pick_up_label(args):
 
 def _rest(skills, args):
     turns = _int_arg(args, "turns", None, 1, 1000)
+    effect = args.get("effect")
     return skills.rest(SESSION, turns=turns, until=str(args.get("until") or "hp"),
                        max_turns=_int_arg(args, "max_turns", 200, 1, 1000),
-                       ignore_monsters=_bool_arg(args, "ignore_monsters"))
+                       ignore_monsters=_bool_arg(args, "ignore_monsters"),
+                       effect=None if effect is None else str(effect))
+
+
+def _rest_label(args):
+    if args.get("effect"):
+        return "wait for %s to end" % args["effect"]
+    return "wait %s turns" % args["turns"] if args.get("turns") else "rest"
 
 
 tool_pick_up = _skill_tool("pick_up", _pick_up_label, _pick_up)
-tool_rest = _skill_tool(
-    "rest", lambda a: "wait %s turns" % a["turns"] if a.get("turns") else "rest", _rest)
+tool_rest = _skill_tool("rest", _rest_label, _rest)
 
 
 TOOLS = [
@@ -1463,12 +1588,13 @@ TOOLS = [
     },
     {
         "name": "rest",
-        "description": "Skill: wait a turn at a time until HP is full, watching for trouble. Use it instead of sending a row of '.' keys: it stops at once when HP drops or a monster comes into view or next to you, it stops when there is nothing left to recover, and it steps off a known arrow or dart trap first (one fires every turn you stand on it). until picks what to recover; turns waits a set number of turns whatever HP is, to let an effect wear off. It works while blind or confused. Results: rested (nothing left to recover), waited (the turns asked for have passed), max_turns, or the reason it was interrupted.",
+        "description": "Skill: wait a turn at a time until HP is full, watching for trouble. Use it instead of sending a row of '.' keys: it stops at once when HP drops or a monster comes into view or next to you, it stops when there is nothing left to recover, and it steps off a known arrow or dart trap first (one fires every turn you stand on it). until picks what to recover; turns waits a set number of turns whatever HP is; effect waits until a timed effect has ended (a time stop, before taking stairs or attacking, say). It works while blind or confused. Results: rested (nothing left to recover), waited (the turns asked for have passed), effect_ended, max_turns, or the reason it was interrupted.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "until": {"type": "string", "enum": ["hp", "spells", "both"], "description": "Rest until HP is full (default), spell points are, or both are."},
                 "turns": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Wait exactly this many turns instead, unless interrupted."},
+                "effect": {"type": "string", "description": "Wait until this effect has ended instead, for at most max_turns waits: its name as get_state's effects list it, such as Time Stop, Hold Monst or Stealth. Not with turns. During a time stop the game clock stands still, so the result's turns stays 0 and steps counts the waits."},
                 "max_turns": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Most turns to rest when turns is not given (default 200). Time is limited: the result says how many passed."},
                 "ignore_monsters": IGNORE_SCHEMA,
                 "include_state": {"type": "boolean"},
@@ -1479,10 +1605,11 @@ TOOLS = [
     },
     {
         "name": "summarize_run",
-        "description": "Write the post-mortem of a recorded game once it is over: what happened, what went wrong and what the next game should try. It is saved with the recording and shown by list_runs and get_run, so later games can learn from it. Needs the server's --record option.",
+        "description": "Write the post-mortem of a recorded game once it is over: what happened, what went wrong and what the next game should try. It is saved with the recording and shown by list_runs and get_run, so later games can learn from it. In a campaign the reply shows the strategy's field notes, for you to bring up to date with note_strategy. Needs the server's --record option.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "takeaway": {"type": "string", "description": "The game in ONE sentence (at most 200 characters): what ended it and the decision that would have changed that. Lists of games show only this."},
                 "synopsis": {"type": "string", "description": "A few sentences on how the game went and why it ended."},
                 "went_wrong": {"type": "array", "items": {"type": "string"},
                                "description": "Mistakes and bad luck, one per entry, most important first."},
@@ -1498,11 +1625,12 @@ TOOLS = [
     },
     {
         "name": "list_runs",
-        "description": "List recorded games, newest first: class, difficulty, strategy, how each ended, how deep it got, and the post-mortem's synopsis and next_try. Read this before a new game to build on earlier ones.",
+        "description": "List recorded games, newest first: class, difficulty, strategy, how each ended, how deep it got, and each game's one-line takeaway. For how a whole strategy has gone, get_strategy is shorter than reading its games.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Most runs to return (default 20)."},
+                "full": {"type": "boolean", "description": "Also give each game's hypotheses, synopsis and next_try (long). Default false."},
                 "difficulty": {"type": "integer", "description": "Only runs at this difficulty."},
                 "strategy": {"type": "string", "description": "Only runs with this strategy name."},
             },
@@ -1511,7 +1639,7 @@ TOOLS = [
     },
     {
         "name": "get_briefing",
-        "description": "Read this before each game of a learning campaign. It names the strategy to play next and what it tests, lists the playbook's lessons, shows every strategy tried with how far each got, summarises the latest games, and sets out the steps of one cycle. A long briefing comes in pages: the first line says how many, and page asks for the next. Needs the server's --record option.",
+        "description": "Read this before each game of a learning campaign. It names the strategy to play next and what it tests, says how that strategy has gone so far (its numbers and field notes), lists the playbook's lessons, shows every strategy tried with how far each got, gives the latest games a line each, and sets out the steps of one cycle. A long briefing comes in pages: the first line says how many, and page asks for the next. Needs the server's --record option.",
         "inputSchema": {"type": "object", "properties": {
             "page": {"type": "integer", "minimum": 1, "description": "Which page to return (default 1)."}}},
         "handler": tool_get_briefing,
@@ -1534,17 +1662,84 @@ TOOLS = [
     },
     {
         "name": "add_lesson",
-        "description": "Add a lesson to the playbook that every later game reads. Cite the runs that showed it. Use confidence 'confirmed' only when more than one run agrees; a lesson seen once is 'tentative'. Repeating an existing lesson adds your evidence to it.",
+        "description": "Add a lesson to the playbook that every later game reads. A lesson is one short instruction (at most 300 characters), not the story of a game. Cite the runs that showed it. Use confidence 'confirmed' only when more than one run agrees; a lesson seen once is 'tentative'. Repeating an existing lesson adds your evidence to it; if yours overlaps one already there, use merge_lessons instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "The lesson, as an instruction a later game can act on."},
+                "text": {"type": "string", "description": "The lesson, as an instruction a later game can act on. At most 300 characters."},
+                "topic": {"type": "string", "description": "A word or two for what it is about (a monster, a place, an item, a tool), e.g. 'dragons', 'volcano', 'town'. Use a topic already in the playbook where one fits."},
                 "evidence": {"type": "array", "items": {"type": "string"}, "description": "Run ids that showed it."},
                 "confidence": {"type": "string", "enum": ["tentative", "confirmed"], "description": "Default tentative."},
             },
             "required": ["text"],
         },
         "handler": tool_add_lesson,
+    },
+    {
+        "name": "merge_lessons",
+        "description": "Fold playbook lessons that say the same or overlapping things into one. The new lesson replaces them and carries all their evidence, so it is confirmed once more than one run stands behind it; the old ones stay on record. With a single id it rewrites that lesson, to shorten it or give it a topic. This is how the playbook stays short enough to read before every game.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lesson_ids": {"type": "array", "items": {"type": "string"}, "description": "The lessons to replace, e.g. ['L3', 'L8']."},
+                "text": {"type": "string", "description": "The one lesson that says what they said, as an instruction. At most 300 characters. Keep the numbers that matter; leave out how it was found."},
+                "topic": {"type": "string", "description": "Its topic (default: the commonest topic among the lessons merged)."},
+            },
+            "required": ["lesson_ids", "text"],
+        },
+        "handler": tool_merge_lessons,
+    },
+    {
+        "name": "get_lessons",
+        "description": "Read the playbook's lessons in full, each with its id, topic, standing and how many runs support it. With about, only those whose topic or text mentions it: use it when a subject comes up in play (a monster, a level, an item). Without it, the whole playbook, in pages if long. Needs the server's --record option.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "about": {"type": "string", "description": "A topic or a word, e.g. 'dragon' or 'volcano'."},
+                "page": {"type": "integer", "minimum": 1, "description": "Which page to return (default 1)."},
+            },
+        },
+        "handler": tool_get_lessons,
+    },
+    {
+        "name": "get_strategy",
+        "description": "Everything about one strategy in one place, so its games need not be read one by one: what it changes, its numbers from the recordings (games, wins, how far they got, what ended them and where), its field notes (the agents' own account of how it plays and dies), and a one-line takeaway for each of its games.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "strategy": {"type": "string", "description": "A strategy id from the briefing, e.g. S2."},
+            },
+            "required": ["strategy"],
+        },
+        "handler": tool_get_strategy,
+    },
+    {
+        "name": "note_strategy",
+        "description": "Rewrite a strategy's field notes: the one short account (at most 1,200 characters) of how the strategy plays, how it dies and what to do differently, which the next agent reads in place of all its games. Call it after summarize_run, which shows the notes as they stand. Write the whole of them again: keep what still holds, add what your game showed, drop what no longer does. Earlier versions are kept.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "strategy": {"type": "string", "description": "The strategy's id, e.g. S2."},
+                "text": {"type": "string", "description": "The notes, whole. At most 1,200 characters."},
+                "run_id": {"type": "string", "description": "The game that prompted the rewrite (default: this session's game, if it was played under the strategy)."},
+            },
+            "required": ["strategy", "text"],
+        },
+        "handler": tool_note_strategy,
+    },
+    {
+        "name": "write_recipe",
+        "description": "Write, or rewrite whole, the recipe of a winning line: a strategy the campaign makes when a game is WON, to follow that win. The recipe is the staged plan the next agent plays from (at most 2,500 characters): the stages in order, what to have before leaving each one in numbers (character level, HP, AC, WC, scrolls and potions carried), and the killers with the answer to each. Nothing about where things lay on one map. Call it after summarize_run, which says when a recipe is wanted and gives the run sheet, or the comparison with the game that won, to write it from. Earlier versions are kept.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The recipe, whole. At most 2,500 characters."},
+                "strategy": {"type": "string", "description": "The winning line's id (default: the one this session's game belongs to)."},
+                "run_id": {"type": "string", "description": "The game that prompted the rewrite (default: this session's game)."},
+            },
+            "required": ["text"],
+        },
+        "handler": tool_write_recipe,
     },
     {
         "name": "retract_lesson",

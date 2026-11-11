@@ -623,6 +623,29 @@ class SkillsTest(unittest.TestCase):
         turn = p.gtime
         r = sk.rest(s, turns=3)                                         # plain waiting
         self.assertEqual((r["result"], r["turns"], p.gtime), ("waited", 3, turn + 3), r)
+
+        # Until an effect ends.  A time stop holds the clock, so the waits
+        # are counted in steps and no game time passes.
+        p.c[p.STEALTH] = 4
+        r = sk.rest(s, effect="stealth")
+        self.assertEqual((r["result"], r["effect"], r["turns"]), ("effect_ended", "Stealth", 4), r)
+        self.assertEqual(sk.rest(s, effect="Stealth")["note"], "that effect is not running")
+        p.c[p.TIMESTOP] = 5
+        turn = p.gtime
+        r = sk.rest(s, effect="Time  Stop")
+        self.assertEqual((r["result"], r["turns"], r["steps"], p.gtime),
+                         ("effect_ended", 0, 5, turn), r)
+        p.c[p.HOLDMONST] = 50
+        self.assertEqual(sk.rest(s, effect="hold monst", max_turns=3)["result"], "max_turns")
+        p.c[p.HOLDMONST] = 0
+        for bad in ({"effect": "luck"}, {"effect": "stealth", "turns": 2}):
+            with self.assertRaises(sk.SkillError):
+                sk.rest(s, **bad)
+        # Effects the game announces but does not list are named too.
+        p.c[p.HASTEMONST] = p.c[p.AGGRAVATE] = 9
+        self.assertLessEqual({"Haste Monsters", "Aggravate"}, set(s.state()["effects"]))
+        p.c[p.HASTEMONST] = p.c[p.AGGRAVATE] = 0
+        self.assertEqual(s.state()["effects"], [])
         p.c[p.HP] = 1
         self.assertEqual(sk.rest(s, max_turns=2)["result"], "max_turns")
 
@@ -678,6 +701,36 @@ class SkillsTest(unittest.TestCase):
         p.c[p.BLINDCOUNT] = 0
         with self.assertRaises(sk.SkillError):
             sk.rest(s, until="mana")
+
+    def test_direction_question_is_a_prompt(self):
+        sk, s, p = self.skills, self.s, self.E.player
+        p.spelknow[1] = 1                       # magic missile
+        p.c[p.INTELLIGENCE] = 18
+        for _ in range(8):                      # a cast can fizzle before it asks
+            p.c[p.SPELLS] = 5
+            s.send("c")
+            s.send("mle")
+            if self.kind() != "command":
+                break
+        self.assertIn("In What Direction?", s.screen())
+        # The key is read the way a command is, but it answers the question:
+        # the status says so, and no skill starts by answering it.
+        self.assertEqual(s.state()["input"], {"kind": "prompt", "answers": list("hjklyubn")})
+        self.assertIn("waiting for an answer", s.status_line())
+        turn = p.gtime
+        for skill in (sk.rest, sk.explore):
+            with self.assertRaises(sk.SkillError):
+                skill(s)
+        self.assertEqual(p.gtime, turn)
+        sk.behave_as(4)                         # as it was: taken for a command
+        try:
+            self.assertEqual(sk.Runner(s).kind(), "command")
+        finally:
+            sk.behave_as()
+        s.send("x")                             # not a direction: still asking
+        self.assertEqual(self.kind(), "prompt")
+        s.send("h")
+        self.assertEqual(self.kind(), "command")
 
     def test_what_is_in_the_way(self):
         sk, s, itm, d, monster = self.skills, self.s, self.E.itm, self.E.dungeon, self.E.monster

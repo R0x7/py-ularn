@@ -222,7 +222,9 @@ class JudgingTest(unittest.TestCase):
         extra = [9001, 9002, 9003, 9004]
 
         self.play(s2, ["win"], seeds=extra)
-        self.assertFalse(self.advance())                  # one win of the last three: stay
+        self.assertTrue(self.advance())                   # one win of the last three: stay...
+        line = self.c["strategies"]["S7"]                 # ...but the win gets a line to follow it
+        self.assertEqual((line["kind"], line["parent"], self.c["difficulty"]), ("line", s2, 0))
         rung = learn.ladder(self.c, self.games)
         self.assertEqual((rung["difficulty"], rung["recent_wins"], rung["wins"], rung["window"]),
                          (0, 1, 2, 3))
@@ -247,7 +249,12 @@ class JudgingTest(unittest.TestCase):
         self.assertEqual((st[s2]["runs"], st["S1"]["runs"]), (0, 0))
         self.assertEqual([self.status(s) for s in (s2, on_trial, checking, stalled, failed)],
                          ["proven", "trial", "trial", "proven", "abandoned"])
+        # The line made from the wins below was never tried, so it still comes first;
+        # after it, the base is measured again.
+        self.assertEqual((line["status"], len(line["models"]), self.next()[0]), ("line", 3, "S7"))
+        line["status"] = "abandoned"
         self.assertEqual(self.next()[:2], (s2, "measuring the base, so later ideas have something to beat"))
+        line["status"] = "line"
         self.assertEqual(learn.next_seed(self.c, s2, st), self.c["seeds"]["trial"][0])
         self.assertEqual(learn.ladder(self.c, self.games)["games"], 0)
 
@@ -280,9 +287,104 @@ class JudgingTest(unittest.TestCase):
         self.assertEqual(len(c["seeds"]["trial"]), 5)
         self.assertEqual(learn.load(root), c)        # and it is saved that way
 
+    def test_a_win_becomes_a_line_to_follow(self):
+        self.play("S1", [3, 3, 3])
+        idea = self.add("Armour")
+        self.play(idea, ["win"])                       # game r3 wins its first trial seed
+        self.assertTrue(self.advance())
+        line = self.c["strategies"]["S3"]
+        self.assertEqual((line["kind"], line["status"], line["parent"], line["models"]),
+                         ("line", "line", idea, ["r3"]))
+        self.assertEqual(line["title"], "Winning line: Armour")
+        self.assertIn("won game r3", line["change"])
+        # It gets seeds of its own that nobody has played.
+        taken = set(self.c["seeds"]["trial"]) | set(self.c["seeds"]["holdout"])
+        self.assertEqual((len(line["seeds"]), len(set(line["seeds"]) & taken)), (3, 0))
+        self.assertIn("S3 is made to follow that win", self.c["log"][-1]["text"])
+        # It is played next, ahead of the trial in progress, on the first of them.
+        sid, why, needs_proposal = self.next()
+        self.assertEqual((sid, needs_proposal), ("S3", False))
+        self.assertIn("follows the won game r3", why)
+        st = learn.stats(self.c, self.games)
+        self.assertEqual(learn.next_seed(self.c, "S3", st), line["seeds"][0])
+        self.assertFalse(self.advance())               # nothing more to decide yet
+
+        # Winning the same seed again shows nothing: it is not a win, and makes no line.
+        self.play(idea, ["win"])                       # r4, the seed r3 won
+        self.assertEqual(learn.repeat_wins(self.games), {"r4"})
+        self.advance()
+        self.assertEqual(sorted(self.c["strategies"]), ["S1", "S2", "S3"])
+        self.assertEqual(learn.ladder(self.c, self.games)["total_wins"], 1)
+        self.assertEqual(learn.stats(self.c, self.games)[idea]["wins"], 1)
+        # A second win on another seed, while the line is being tried, is one more model.
+        self.play(idea, ["win"], seeds=[777])          # r5
+        self.advance()
+        self.assertEqual((sorted(self.c["strategies"]), line["models"]),
+                         (["S1", "S2", "S3"], ["r3", "r5"]))
+
+        # The line is judged on wins on its own seeds: two losses decide nothing...
+        self.play("S3", [2, 4], seeds=line["seeds"])
+        self.advance()
+        self.assertEqual((self.status("S3"), self.next()[0]), ("line", "S3"))
+        st = learn.stats(self.c, self.games)
+        self.assertEqual(learn.next_seed(self.c, "S3", st), line["seeds"][2])
+        self.assertIn("2 of 3 games on unseen seeds, 0 won", learn._stat_text(self.c, line, st["S3"]))
+        # ...and one win proves it and makes it the base.
+        self.play("S3", ["win"], seeds=line["seeds"][2:])
+        self.assertTrue(self.advance())
+        self.assertEqual((self.status("S3"), self.c["base"]), ("proven", "S3"))
+        self.assertEqual(line["note"], "won 1 of its first 3 games on seeds nobody had played")
+        self.assertIn("S3 Winning line: Armour proven", self.c["log"][-1]["text"])
+        # A win under a line is the line working: it makes no line of its own.
+        self.assertEqual(sorted(self.c["strategies"]), ["S1", "S2", "S3"])
+
+    def test_a_line_that_cannot_repeat_the_win_is_abandoned(self):
+        self.play("S1", ["win", 3, 3])
+        self.advance()
+        line = self.c["strategies"]["S2"]
+        self.assertEqual((line["parent"], line["status"]), ("S1", "line"))
+        self.play("S2", [9, 9, 9], seeds=line["seeds"])
+        self.advance()
+        self.assertEqual(self.status("S2"), "abandoned")
+        self.assertIn("won none of its 3 games on seeds nobody had played", line["note"])
+        self.assertEqual(self.c["base"], "S1")
+        self.assertEqual(self.next()[0], "S1")
+        # The next win under the baseline gets a line of its own.
+        self.play("S1", ["win"], seeds=[4242])
+        self.advance()
+        self.assertEqual((self.c["strategies"]["S3"]["kind"], self.next()[0]), ("line", "S3"))
+
+    def test_digest_of_a_strategy(self):
+        def game(n, sid="S1", level="V5", killer=None, result="died", difficulty=0, turns=100,
+                 won=False, cure=False):
+            outcome = {"result": result, "won": won, "has_cure": cure, "killer": killer,
+                       "reason": "killed by a %s" % killer if killer else result,
+                       "dungeon_level": level, "turns": turns,
+                       "deepest": {"dungeon": 3, "volcano": 5 if level == "V5" else 0}}
+            return {"run_id": "g%d" % n, "strategy": sid, "seed": n, "difficulty": difficulty,
+                    "outcome": outcome, "progress": learn.progress(outcome)}
+
+        games = [game(7, sid="S9"), game(6, difficulty=1), game(5, result="stopped"),
+                 game(4, result="won", won=True, turns=900), game(3, level="H", result="quit", turns=5),
+                 game(2, killer="white dragon", cure=True, turns=700),
+                 game(1, killer="white dragon", turns=300)]          # newest first
+        self.assertEqual(learn._digest_lines(learn.digest(self.c, "S1", [])), ["No finished game yet."])
+        d = learn.digest(self.c, "S1", games)
+        # Only finished games of this strategy at this difficulty count.
+        self.assertEqual([m["run_id"] for m in d["runs"]], ["g4", "g3", "g2", "g1"])
+        self.assertEqual((d["games"], d["wins"], d["cure"], d["median_turns"]), (4, 1, 2, 700))
+        self.assertEqual(d["ended_by"], [("white dragon", 2), ("quit", 1)])
+        self.assertEqual(learn._digest_lines(d), [
+            "4 games: 1 won, 2 held the cure. Average progress %s; best: won." % d["mean"],
+            "Ended by: white dragon ×2, quit.",
+            "Ended on level: V5 ×2, town. A game lasted about 700 turns."])
+        with self.assertRaises(learn.LearnError):
+            learn.digest(self.c, "S9", games)
+
     def test_rules_are_checked(self):
         for bad in ({"budget": 0}, {"margin": -1}, {"patience": 0}, {"holdout": -1}, {"luck": 1},
-                    {"wins": 0}, {"wins": 6}, {"window": 2}, {"top": 101}, {"top": -1}):
+                    {"wins": 0}, {"wins": 6}, {"window": 2}, {"top": 101}, {"top": -1},
+                    {"playbook_budget": 10}):
             with self.assertRaises(learn.LearnError):
                 learn.new_campaign(rules=bad)
         with self.assertRaises(learn.LearnError):
@@ -361,9 +463,9 @@ class CampaignTest(unittest.TestCase):
                   went_wrong=["Had no armour"], next_try=["Buy armour first"])
 
         # --- lessons cite runs
-        self.assertIn("L1 saved as tentative, citing 1 run.",
+        self.assertIn('L1 saved as tentative under "armour", citing 1 run.',
                       self.call("add_lesson", text="Level 1 monsters hit hard without armour.",
-                                evidence=[first]))
+                                topic="Armour", evidence=[first]))
         self.assertIn("confirmed lesson must cite", self.fails(
             "add_lesson", text="Armour is good.", confidence="confirmed"))
         self.assertIn("no such run", self.fails("add_lesson", text="x", evidence=["nope"]))
@@ -393,12 +495,12 @@ class CampaignTest(unittest.TestCase):
         self.assertIn("Why this one: on trial against S1.", text)
         self.assertIn("Character class: dwarf.", text)
         self.assertIn("- Buy leather armor before entering the dungeon **(the change on trial)**", text)
-        self.assertIn("- L1: Level 1 monsters hit hard without armour. (runs: %s)" % first, text)
+        self.assertIn("- L1 [armour]: Level 1 monsters hit hard without armour.\n", text)
         self.assertIn("- **S1 Baseline** [proven, the base]: 1 of 1 trial games, "
                       "average progress 0.03, best: never left town", text)
         self.assertIn("  - **S2 Armour first** [on trial]: not played yet ← play this next", text)
         self.assertIn("- %s (S1): Quit" % first, text)
-        self.assertIn("  - went wrong: Had no armour", text)
+        self.assertIn("got to: never left town. Had no armour\n", text)   # no takeaway given
 
         # --- its games take everything from the strategy; a stopped game does not count
         self.call("new_game", strategy="S2")
@@ -464,10 +566,10 @@ class CampaignTest(unittest.TestCase):
         self.assertEqual((self.meta(other)["hypotheses"], self.meta(other)["seed"]), (["wing it"], 5))
 
         # --- lessons: confirmed by a second run, or retracted
-        self.assertIn("L1 saved as confirmed, citing 2 runs.",
+        self.assertIn('L1 saved as confirmed under "armour", citing 2 runs.',
                       self.call("add_lesson", text="level 1 monsters hit hard without armour.",
                                 evidence=[second], confidence="confirmed"))
-        self.call("add_lesson", text="Never use the bank.")
+        self.call("add_lesson", text="Never use the bank.", topic="town")
         self.assertIn("L2 retracted", self.call("retract_lesson", lesson_id="L2",
                                                 reason="Gold in the bank earns interest."))
         self.fails("retract_lesson", lesson_id="L9", reason="x")
@@ -477,7 +579,7 @@ class CampaignTest(unittest.TestCase):
         self.assertNotIn("Never use the bank", text)
 
         doc = self.read("CAMPAIGN.md")
-        self.assertIn("- L1: Level 1 monsters hit hard without armour. (runs: %s, %s)" % tuple(
+        self.assertIn("- L1 [armour]: Level 1 monsters hit hard without armour. (runs: %s, %s)" % tuple(
             sorted([first, second])), doc)
         self.assertIn("- L2: ~~Never use the bank.~~ Gold in the bank earns interest.", doc)
         self.assertIn("    - **S3 And a shield** [abandoned]: 1 of 1 trial games", doc)
@@ -487,6 +589,269 @@ class CampaignTest(unittest.TestCase):
         self.assertIn("S2 Armour first proven: trial average 1.02; averaged 1.02 on 1 unseen "
                       "seeds, S1 averaged 0.03 on the trial seeds; it is the new base.", doc)
         self.assertIn("| Progress |", self.read("INDEX.md"))
+
+    def test_strategy_digest_and_field_notes(self):
+        # --- a game leaves a one-line takeaway, and is asked for the strategy's notes
+        first = self.play("S1", 0, character_class="dwarf")
+        text = self.call("summarize_run", takeaway="Quit in town with nothing tried.",
+                         synopsis="Never left town.", went_wrong=["Had no armour"])
+        self.assertIn("Now bring the field notes of S1 up to date with note_strategy", text)
+        self.assertIn("There are none yet: yours will be the first.", text)
+        self.assertNotIn("No takeaway was given", text)
+        self.assertEqual(self.meta(first)["notes"]["takeaway"], "Quit in town with nothing tried.")
+        self.assertIn("**In one line:** Quit in town with nothing tried.",
+                      self.read(first, "summary.md"))
+        self.assertIn("at most 200", self.fails("summarize_run", synopsis="x", takeaway="y" * 201))
+
+        self.assertEqual(self.call("note_strategy", strategy="S1", text="Buy armour before level 1.\n"),
+                         "Field notes of S1 Baseline saved (26 characters), covering 1 game.")
+        notes = learn.load(self.root)["strategies"]["S1"]["notes"]
+        self.assertEqual((notes["text"], notes["run"], notes["games"]),
+                         ("Buy armour before level 1.", first, 1))
+        self.assertIn("no strategy called 'S9'", self.fails("note_strategy", strategy="S9", text="x"))
+        self.assertIn("the notes are empty", self.fails("note_strategy", strategy="S1", text="  "))
+        self.assertIn("at most 1200 characters and these are 1201",
+                      self.fails("note_strategy", strategy="S1", text="z" * 1201))
+        self.assertIn("no such run", self.fails("note_strategy", strategy="S1", text="x", run_id="nope"))
+
+        # --- one call gives the strategy whole: no reading its games one by one
+        text = self.call("get_strategy", strategy="S1")
+        self.assertIn("# S1 Baseline [proven, the base]", text)
+        self.assertIn("1 game: 0 won, 0 held the cure. Average progress 0.03; best: never left town.",
+                      text)
+        self.assertIn("Ended by: quit.", text)
+        self.assertRegex(text, r"Ended on level: town\. A game lasted about \d+ turns\.")
+        self.assertIn("Field notes (written after 1 of its 1 games):\n\nBuy armour before level 1.", text)
+        self.assertRegex(text, r"- %s: Quit.*; got to: never left town\. Quit in town with nothing "
+                               r"tried\." % re.escape(first))
+        self.fails("get_strategy", strategy="S9")
+        self.fails("get_strategy")
+
+        # --- the briefing carries it for the strategy to play, and for what it builds on
+        self.call("propose_strategy", title="Armour first", change="Buy leather armor")
+        text = self.call("get_briefing")
+        self.assertIn("## Play this strategy: S2 Armour first", text)
+        self.assertIn("### How it has gone\n\nNo finished game yet.\n\n_No field notes yet._", text)
+        self.assertIn("Field notes of S1 Baseline, which this builds on (written after 1 of its 1 "
+                      "games):\n\nBuy armour before level 1.", text)
+        self.assertIn("got to: never left town. Quit in town with nothing tried.\n", text)
+        self.assertNotIn("  - went wrong", text)        # the old three-line extract per game
+
+        # --- notes fall behind as games are played, and are rewritten, not added to
+        second = self.play("S1", 0, character_class="dwarf")
+        text = self.call("summarize_run", synopsis="Again.")
+        self.assertIn("No takeaway was given", text)
+        self.assertIn("The notes as they stand:\n\nBuy armour before level 1.", text)
+        self.assertIn("(written after 1 of its 2 games; 1 newer game not in them yet):",
+                      self.call("get_strategy", strategy="S1"))
+        self.call("note_strategy", strategy="S1", text="Buy armour. Do not quit.")
+        s1 = learn.load(self.root)["strategies"]["S1"]
+        self.assertEqual((s1["notes"]["text"], s1["notes"]["run"], s1["notes"]["games"]),
+                         ("Buy armour. Do not quit.", second, 2))
+        self.assertEqual([n["text"] for n in s1["notes_history"]], ["Buy armour before level 1."])
+        doc = self.read("CAMPAIGN.md")
+        self.assertIn("## How each strategy has gone", doc)
+        self.assertIn("### S1 Baseline\n\n2 games: 0 won", doc)
+        self.assertIn("Buy armour. Do not quit.", doc)
+        self.assertNotIn("### S2 Armour first", doc)        # not played yet
+
+        # --- lists of games are one line each unless the whole is asked for
+        listed = json.loads(self.call("list_runs"))["runs"]
+        self.assertEqual([r["takeaway"] for r in listed],
+                         ["Again.", "Quit in town with nothing tried."])
+        self.assertNotIn("synopsis", listed[1])
+        self.assertEqual(json.loads(self.call("list_runs", full=True))["runs"][1]["synopsis"],
+                         "Never left town.")
+
+        # --- a slip in the strategy's name still counts for it; another name is flagged
+        text = self.call("new_game", strategy="s1 baseline")
+        run = re.search(r"as run (\S+)\.", text).group(1)
+        self.assertNotIn("is not a strategy", text)
+        self.call("end_game")
+        self.assertEqual(self.meta(run)["strategy"], "S1")
+        text = self.call("new_game", strategy="freestyle")
+        self.assertIn('"freestyle" is not a strategy of the campaign (S1, S2), so this game '
+                      'counts towards none of them.', text)
+        self.call("end_game")
+
+    def test_a_win_leaves_a_recipe(self):
+        first = self.play("S1", 1, character_class="dwarf")
+        # Make it a win on disk: a real one takes hours of play.
+        meta = self.meta(first)
+        meta["outcome"].update(result="won", won=True, has_cure=True)
+        meta["progress"] = learn.progress(meta["outcome"])
+        runs.save_meta(os.path.join(self.root, first), meta)
+
+        # --- the campaign makes a strategy that follows the win, and plays it next
+        text = self.call("get_briefing")
+        self.assertIn("## Play this strategy: S2 Winning line: Baseline", text)
+        self.assertIn("Why this one: it follows the won game %s; this tries its recipe on a seed "
+                      "nobody has played." % first, text)
+        self.assertIn("### The recipe to follow", text)
+        self.assertIn("_No recipe has been written yet.", text)
+        self.assertIn("The game that won, %s. Measure yourself against it" % first, text)
+        self.assertRegex(text, r"\| First on \| Turn \| Char level \|[^\n]*\n\|[-|]+\n\| H \| 0 \|"
+                               r"[^\n]*\n\| 1 \| \d+ \| 1 \|")
+        self.assertIn("  - **S2 Winning line: Baseline** [following a win]: not played yet "
+                      "← play this next", text)
+        line = learn.load(self.root)["strategies"]["S2"]
+        self.assertEqual((line["character_class"], line["models"]), ("dwarf", [first]))
+        self.assertIn("S2 Winning line: Baseline follows the won game %s and has no recipe: "
+                      "write it (write_recipe) from that game." % first, learn.upkeep(self.root))
+
+        # --- writing the win up asks for the recipe, with the run sheet to write it from
+        text = self.call("summarize_run", run_id=first, synopsis="Won.", takeaway="Won it.")
+        self.assertIn("This game was WON. S2 Winning line: Baseline has been made to follow it", text)
+        self.assertIn('Write its recipe now with write_recipe (strategy "S2", at most 2500 '
+                      'characters)', text)
+        self.assertIn("what you must have before going on, in numbers", text)
+        self.assertIn("The run sheet of your game:\n\n| First on |", text)
+        self.assertNotIn("note_strategy", text)
+        self.assertIn("### Run sheet", self.read(first, "summary.md"))
+        self.assertEqual(self.call("write_recipe", text="Stage 1: buy armour. Go on at AC 10."),
+                         "Recipe of S2 Winning line: Baseline saved (36 characters). It is what "
+                         "the next game under S2 plays from.")
+        self.assertIn("S1 is not a winning line", self.fails("write_recipe", strategy="S1", text="x"))
+        self.assertIn("at most 2500 characters and this is 2501",
+                      self.fails("write_recipe", strategy="S2", text="r" * 2501))
+        self.assertIn("the recipe is empty", self.fails("write_recipe", text=" "))
+        self.assertIn("its account is its recipe",
+                      self.fails("note_strategy", strategy="S2", text="x"))
+        text = self.call("get_briefing")
+        self.assertIn("The recipe (as rewritten after 0 of this line's 0 games):\n\n"
+                      "Stage 1: buy armour. Go on at AC 10.", text)
+        text = self.call("get_strategy", strategy="S2")
+        self.assertIn("# S2 Winning line: Baseline [following a win]", text)
+        self.assertIn("## Recipe\n\nThe recipe (as rewritten", text)
+        self.assertEqual([j for j in learn.upkeep(self.root) if "recipe" in j], [])
+
+        # --- a game under it: the winner's class, a seed nobody has played, and afterwards
+        #     the game set beside the win, to revise the recipe from
+        second = self.play("S2", 0)
+        meta = self.meta(second)
+        self.assertEqual((meta["character_class"], meta["seed"]), ("Dwarf", line["seeds"][0]))
+        self.assertIn("Follow the recipe distilled from the won game", meta["hypotheses"][0])
+        text = self.call("summarize_run", synopsis="Stayed in town.")
+        self.assertIn("This game followed the winning line S2. Now rewrite its recipe with "
+                      'write_recipe (strategy "S2", at most 2500 characters, the whole of it)', text)
+        self.assertIn("change the stage where this game went wrong", text)
+        self.assertIn("Your game beside the game that won:\n\n| First on | The game that won | "
+                      "This game |", text)
+        self.assertRegex(text, r"\| 1 \| turn \d+: level 1, \d+ HP, AC \d+, WC \d+ \| never reached \|")
+        self.assertIn("It never reached level 1, which the winner entered on turn", text)
+        self.assertIn("The recipe as it stands:\n\nStage 1: buy armour. Go on at AC 10.", text)
+        self.call("write_recipe", text="Stage 1: buy armour, then go down at once.")
+        line = learn.load(self.root)["strategies"]["S2"]
+        self.assertEqual((line["recipe"]["text"], line["recipe"]["run"], line["recipe"]["games"]),
+                         ("Stage 1: buy armour, then go down at once.", second, 1))
+        self.assertEqual([r["text"] for r in line["recipe_history"]],
+                         ["Stage 1: buy armour. Go on at AC 10."])
+        # With one seed to its name (this campaign's budget) and no win on it, the line is dropped.
+        self.assertEqual(line["status"], "abandoned")
+        self.assertIn("won none of its 1 game on seeds nobody had played", line["note"])
+        doc = self.read("CAMPAIGN.md")
+        self.assertIn("### S2 Winning line: Baseline", doc)
+        self.assertIn("Stage 1: buy armour, then go down at once.", doc)
+
+        # --- the same seed won again is not a second win
+        third = self.play("S1", 0, character_class="dwarf")
+        meta = self.meta(third)
+        meta["seed"] = self.meta(first)["seed"]
+        meta["outcome"].update(result="won", won=True, has_cure=True)
+        meta["progress"] = learn.progress(meta["outcome"])
+        runs.save_meta(os.path.join(self.root, third), meta)
+        text = self.call("get_briefing")
+        self.assertIn("3 games played here, 1 won.", text)
+        campaign = learn.load(self.root)
+        self.assertEqual(sorted(campaign["strategies"]), ["S1", "S2"])     # no new line
+        self.assertEqual(learn.repeat_wins(runs.list_runs(self.root)), {third})
+        self.assertEqual(learn.ladder(campaign, runs.list_runs(self.root))["total_wins"], 1)
+
+    def test_the_playbook_keeps_to_its_budget(self):
+        first = self.play("S1", 0, character_class="dwarf")
+        second = self.play("S1", 0, character_class="dwarf")
+
+        # --- a lesson is short and has a topic
+        self.assertIn("at most 300 characters and this is 301",
+                      self.fails("add_lesson", text="x" * 301, topic="town"))
+        self.assertIn("a lesson needs a topic", self.fails("add_lesson", text="Rest often."))
+        self.assertIn("at most 30 characters", self.fails("add_lesson", text="y", topic="t" * 31))
+        self.assertIn('L1 saved as tentative under "dragons", citing 1 run.', self.call(
+            "add_lesson", topic=" Dragons ", evidence=[first],
+            text="White dragons breathe for 15 to 30 a turn: do not fight one, leave by the stairs."))
+        self.call("add_lesson", topic="dragons", evidence=[second],
+                  text="Never melee a white dragon below 80 HP.")
+        self.call("add_lesson", topic="town", text="Sell gems at the bank.")
+        self.assertIn("Topics in use: dragons, town.", self.fails("add_lesson", text="Rest often."))
+
+        # --- a subject can be looked up
+        text = self.call("get_lessons", about="Dragon")
+        self.assertIn("2 lessons about 'dragon'. The whole playbook is", text)
+        self.assertIn("- L1 [dragons] (tentative, 1 run, 81 chars): White dragons breathe", text)
+        self.assertNotIn("Sell gems", text)
+        self.assertIn("- L3 [town] (tentative, 0 runs, 22 chars): Sell gems at the bank.",
+                      self.call("get_lessons"))
+        self.assertIn("_Nothing on that; topics in use: dragons, town._",
+                      self.call("get_lessons", about="lemmings"))
+
+        # --- overlapping lessons fold into one, which keeps their evidence
+        size = learn.playbook_size(learn.load(self.root))
+        merged = "Do not fight a white dragon: it breathes for 15 to 30 a turn. Leave by the stairs."
+        text = self.call("merge_lessons", lesson_ids=["L1", "L2"], text=merged)
+        self.assertEqual(text, 'Lesson L4 (confirmed, under "dragons", citing 2 runs) replaces L1, L2. '
+                               'The playbook is %d characters shorter.' % (81 + 39 - len(merged)))
+        campaign = learn.load(self.root)
+        by_id = {l["id"]: l for l in campaign["lessons"]}
+        self.assertEqual((by_id["L1"]["status"], by_id["L1"]["note"]), ("merged", "merged into L4"))
+        self.assertEqual((by_id["L4"]["merged_from"], by_id["L4"]["evidence"]),
+                         (["L1", "L2"], sorted([first, second])))
+        self.assertEqual(learn.playbook_size(campaign), size - (81 + 39 - len(merged)))
+        self.assertIn("L1 is merged: merged into L4",
+                      self.fails("merge_lessons", lesson_ids=["L1", "L3"], text="x"))
+        self.assertIn("no lesson called 'L9'", self.fails("merge_lessons", lesson_ids=["L9"], text="x"))
+        self.assertIn("named twice", self.fails("merge_lessons", lesson_ids=["L3", "L3"], text="x"))
+        self.assertIn("at most 300", self.fails("merge_lessons", lesson_ids=["L3"], text="x" * 301))
+        self.fails("merge_lessons", lesson_ids=[], text="x")
+        # One id rewrites a lesson; with nothing new behind it, it stays tentative.
+        self.assertIn('Lesson L5 (tentative, under "town", citing 0 runs) replaces L3.', self.call(
+            "merge_lessons", lesson_ids="L3", text="Sell gems at the bank, not the trading post."))
+
+        text = self.call("get_briefing")
+        self.assertIn("Confirmed, follow these:\n\n- L4 [dragons]: %s (2 runs)\n" % merged, text)
+        self.assertIn("Tentative, seen once:\n\n- L5 [town]: Sell gems at the bank, not", text)
+        self.assertNotIn("Never melee", text)
+        self.assertNotIn("outgrown its budget", text)
+        doc = self.read("CAMPAIGN.md")
+        self.assertIn("### Merged", doc)
+        self.assertIn("- L4 ← L1, L2", doc)
+        self.assertIn("- L4 [dragons]: %s (runs: %s, %s)" % ((merged,) + tuple(sorted([first, second]))),
+                      doc)
+
+        # --- over its budget, the briefing lists what was seen once instead of carrying it
+        campaign = learn.load(self.root)
+        campaign["rules"]["playbook_budget"] = 100
+        learn.save(self.root, campaign)
+        learn.add_lesson(self.root, "An old lesson, from before lessons had topics.", topic="x")
+        campaign = learn.load(self.root)
+        del campaign["lessons"][-1]["topic"]
+        learn.save(self.root, campaign)
+        text = self.call("get_briefing")
+        self.assertIn("The playbook has outgrown its budget", text)
+        self.assertIn("- L4 [dragons]: %s (2 runs)" % merged, text)             # confirmed: in full
+        self.assertIn("Tentative, seen once:\n\n- L6: An old lesson, from before", text)   # no topic yet
+        self.assertIn("Tentative, by topic. Read them when the subject comes up", text)
+        self.assertIn("- town: L5\n", text)
+        self.assertNotIn("not the trading post", text)
+        self.assertIn("over its budget of 100", self.call(
+            "add_lesson", text="Lemmings breed.", topic="lemmings"))
+        jobs = learn.upkeep(self.root)
+        self.assertRegex(jobs[0], r"^The playbook is \d+ characters in 4 lessons, and its budget is 100")
+        self.assertEqual(jobs[1:], ["S1 Baseline has 2 games and no field notes: write them."])
+        campaign = learn.load(self.root)
+        campaign["rules"]["playbook_budget"] = 12000
+        learn.save(self.root, campaign)
+        self.assertEqual(learn.upkeep(self.root)[0],
+                         "1 lessons have no topic: give each one (merge_lessons with its own id).")
 
 
 class LadderGameTest(unittest.TestCase):
@@ -558,7 +923,9 @@ class LadderGameTest(unittest.TestCase):
         self.assertIn("- Difficulty 0 cleared", text)
         self.assertIn(": 2 wins in 2 games, with S1 as the base.", text)
         self.assertIn("This difficulty is new.", text)
-        self.assertIn("Why this one: measuring the base", text)
+        # Both wins were under S1: the first made a line to follow it, the second joined it.
+        self.assertIn("## Play this strategy: S2 Winning line: Baseline", text)
+        self.assertEqual(len(campaign["strategies"]["S2"]["models"]), 2)
 
         # The next games are played at the new difficulty; two wins finish it.
         self.assertEqual(self.win()["difficulty"], 1)
@@ -583,13 +950,95 @@ class LadderGameTest(unittest.TestCase):
         self.assertEqual(os.environ["PYULARN_HOME"], self.own_home)
 
     def test_lessons_remember_their_difficulty(self):
-        learn.add_lesson(self.root, "Buy armour first.")
+        learn.add_lesson(self.root, "Buy armour first.", topic="town")
         campaign = learn.load(self.root)
         self.assertEqual(campaign["lessons"][0]["difficulty"], 0)
-        self.assertIn("- L1: Buy armour first.\n", learn.briefing(self.root) + "\n")
+        self.assertIn("- L1 [town]: Buy armour first.\n", learn.briefing(self.root) + "\n")
         campaign["difficulty"] = 1
         learn.save(self.root, campaign)
-        self.assertIn("- L1: Buy armour first. [learned at difficulty 0]", learn.briefing(self.root))
+        self.assertIn("- L1 [town]: Buy armour first. [learned at difficulty 0]",
+                      learn.briefing(self.root))
+
+
+class RunSheetTest(unittest.TestCase):
+    """The stage-by-stage sheet of a game, from made-up events."""
+
+    @staticmethod
+    def state(level, turn, cl, hp, ac, wc, pack=(), spells=()):
+        return {"level_index": level, "turns": turn, "inventory": list(pack),
+                "known_spells": list(spells),
+                "stats": {"level": cl, "hp_max": hp, "ac": ac, "wc": wc, "gold": 10, "bank": 5}}
+
+    def winner(self):
+        st = self.state
+        worn = ["a)   ring mail (being worn)", "b)   a spear +1 (weapon in hand)"]
+        return [
+            {"type": "start", "state": st(0, 0, 1, 12, 2, 3, ["a)   leather armor (being worn)"],
+                                          ["pro (protection)"])},
+            {"type": "action", "tool": "buy", "s": {"turn": 30, "lvl": 0},
+             "result": {"result": "done", "bought": [{"name": "ring mail", "price": 400}]}},
+            {"type": "action", "tool": "take_stairs", "s": {"turn": 40, "lvl": 1}},
+            {"type": "state", "state": st(1, 40, 1, 12, 5, 3, worn, ["pro (protection)", "sle (sleep)"])},
+            {"type": "action", "tool": "send_keys", "s": {"turn": 900, "lvl": 16}},
+            {"type": "state", "state": st(16, 900, 10, 80, 12, 20, worn)},
+            {"type": "state", "state": st(16, 920, 10, 80, 12, 20,
+                                          worn + ["c)   a magic potion of cure dianthroritis"])},
+            {"type": "action", "tool": "take_stairs", "s": {"turn": 950, "lvl": 0}},
+            {"type": "state", "state": st(0, 950, 11, 85, 12, 20, worn)},     # town again: no new stage
+        ]
+
+    def test_sheet(self):
+        sheet = runs.run_sheet(self.winner())
+        self.assertEqual([s["level"] for s in sheet["stages"]], ["H", "1", "V1"])
+        self.assertEqual(sheet["stages"][1], {"level": "1", "turn": 40, "cl": 1, "hp": 12, "ac": 5,
+                                              "wc": 3, "gold": 15, "spells": 2,
+                                              "kit": ["ring mail", "a spear +1"]})
+        self.assertEqual(sheet["bought"], [{"name": "ring mail", "price": 400, "turn": 30}])
+        self.assertEqual(sheet["spells"], [{"spell": "pro (protection)", "turn": 0},
+                                           {"spell": "sle (sleep)", "turn": 40}])
+        self.assertEqual((sheet["cure"], sheet["home"]),
+                         ({"turn": 920, "level": "V1"}, [{"level": "H", "turn": 950}]))
+        text = "\n".join(runs.sheet_lines(sheet))
+        self.assertIn("| V1 | 900 | 10 | 80 | 12 | 20 | 15 | 0 | ring mail, a spear +1 |", text)
+        self.assertIn("- Bought: turn 30: ring mail (400 gold)", text)
+        self.assertIn("- Spells learned: sle (sleep) by turn 40", text)
+        self.assertIn("- The cure was in the pack by turn 920, on level V1.", text)
+        self.assertIn("- After that: H (turn 950)", text)
+        self.assertEqual(runs.sheet_lines(runs.run_sheet([])), ["_Nothing recorded._"])
+
+    def test_one_game_beside_another(self):
+        st = self.state
+        model = runs.run_sheet(self.winner())
+        same = runs.compare_sheets(model, model)
+        self.assertEqual(same[0], "| First on | The game that won | This game |")
+        self.assertEqual(same[-1], "It kept pace with the winner on arriving at every level. It had "
+                                   "the cure by turn 920 (the winner by turn 920).")
+        # Went down in the armour it started with.
+        weak = runs.run_sheet([{"type": "start", "state": st(0, 0, 1, 12, 2, 3)},
+                               {"type": "state", "state": st(1, 25, 1, 12, 2, 3)}])
+        lines = runs.compare_sheets(model, weak)
+        self.assertIn("| 1 | turn 40: level 1, 12 HP, AC 5, WC 3 | turn 25: level 1, 12 HP, AC 2, WC 3 |",
+                      lines)
+        self.assertIn("| V1 | turn 900: level 10, 80 HP, AC 12, WC 20 | never reached |", lines)
+        self.assertEqual(lines[-1], "It first fell behind the winner on arriving at level 1: "
+                                    "AC 2 against 5.")
+        home = runs.run_sheet([{"type": "start", "state": st(0, 0, 1, 12, 2, 3)}])
+        self.assertEqual(runs.compare_sheets(model, home)[-1],
+                         "It never reached level 1, which the winner entered on turn 40 at "
+                         "character level 1 with 12 HP, AC 5 and WC 3.")
+
+    def test_the_recording_marks_when_the_cure_is_taken(self):
+        from pyularn import recorder
+        root = tempfile.mkdtemp()
+        full = dict(self.state(16, 5, 9, 70, 10, 15), turns=5)
+        rec = recorder.RunRecorder(root, {"seed": 1}, full)
+        rec.action("move", {}, None, full, "screen")
+        with_cure = dict(full, inventory=["a)   a magic potion of cure dianthroritis"], turns=6)
+        rec.action("send_keys", {"keys": "t"}, None, with_cure, "screen")
+        rec.action("move", {}, None, with_cure, "screen")
+        events = runs.read_events(rec.dir)
+        self.assertEqual([e["type"] for e in events], ["start", "action", "action", "state", "action"])
+        self.assertEqual(runs.run_sheet(events)["cure"], {"turn": 6, "level": "V1"})
 
 
 class NoRecordingTest(unittest.TestCase):
@@ -711,6 +1160,60 @@ class CoachTest(unittest.TestCase):
         self.assertEqual(code, 0, text)
         self.assertIn("Continuing the campaign", text)
         self.assertIn("Cycle 1 of 1: strategy S7 Idea 6 (on trial against S1)", text)
+
+    def test_the_editor_tidies_before_play(self):
+        os.environ["FAKE_DEPTH"] = json.dumps({"S1": 0})
+        os.environ["FAKE_NO_NOTES"] = "1"           # this agent skips the field notes
+        try:
+            code, text = self.coach("--agent-cmd", self.agent, "--playbook-budget", "1000")
+        finally:
+            del os.environ["FAKE_NO_NOTES"]
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("Tidying", text)           # a new campaign has nothing to tidy
+        self.assertEqual(learn.upkeep(self.root),
+                         ["S1 Baseline has 1 game and no field notes: write them."])
+
+        # --tidy sends the editor alone: no game is played.
+        code, text = self.coach("--tidy", "--agent-cmd", self.agent)
+        self.assertEqual(code, 0, text)
+        self.assertIn("Tidying before play:\n  - S1 Baseline has 1 game and no field notes", text)
+        self.assertNotIn("still to do", text)
+        self.assertNotIn("Cycle", text)
+        self.assertEqual(learn.load(self.root)["strategies"]["S1"]["notes"]["text"],
+                         "Editor's notes on S1.")
+        self.assertEqual(len(runs.list_runs(self.root)), 1)
+        logs = os.listdir(os.path.join(self.root, "coach-logs"))
+        self.assertEqual(len([n for n in logs if n.startswith("editor-")]), 1)
+        code, text = self.coach("--tidy", "--agent-cmd", self.agent)
+        self.assertEqual(code, 0, text)
+        self.assertIn("Nothing to tidy", text)
+
+        # A playbook over its budget is folded back before the next game...
+        for i in range(5):
+            learn.add_lesson(self.root, "Lesson %d. %s" % (i, "x" * 240), topic="topic %d" % i)
+        self.assertGreater(learn.playbook_size(learn.load(self.root)), 1000)
+        code, text = self.coach("--agent-cmd", self.agent, "--no-tidy", "--print-command")
+        self.assertNotIn("Tidying", text)
+        code, text = self.coach("--agent-cmd", self.agent)
+        self.assertEqual(code, 0, text)
+        self.assertIn("Tidying before play:\n  - The playbook is", text)
+        self.assertRegex(text, r"playbook: 24 characters in 1 lessons, was \d+ in 6 \(budget 1000\)")
+        self.assertLess(text.index("Tidying"), text.index("Cycle 1 of 1"))
+        campaign = learn.load(self.root)
+        self.assertLess(learn.playbook_size(campaign), 1000)
+        # ...and the lesson the games keep teaching kept its evidence through the merge.
+        merged = next(l for l in campaign["lessons"] if l.get("merged_from"))
+        self.assertEqual((merged["status"], len(merged["evidence"])), ("tentative", 1))
+        self.assertEqual(len(runs.list_runs(self.root)), 2)
+
+        # An editor that fails leaves the jobs, says so, and play goes on.
+        learn.add_lesson(self.root, "y" * 300, topic="a")
+        for i in range(4):
+            learn.add_lesson(self.root, "Another %d. %s" % (i, "x" * 240), topic="b")
+        broken = "%s -c 'import sys; sys.exit(3)' {mcp_config}" % sys.executable
+        code, text = self.coach("--tidy", "--agent-cmd", broken)
+        self.assertEqual(code, 1, text)
+        self.assertIn("still to do: The playbook is", text)
 
     def test_agents_that_fail(self):
         broken = "%s -c 'import sys; print(\"boom\"); sys.exit(3)' {mcp_config}" % sys.executable

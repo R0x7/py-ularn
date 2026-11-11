@@ -69,7 +69,8 @@ class McpServerTest(unittest.TestCase):
                                  "get_state", "key_reference", "end_game",
                                  "summarize_run", "list_runs", "get_run",
                                  "explore", "travel_to", "take_stairs", "fight", "flee", "buy",
-                                 "pick_up", "rest", "get_briefing", "propose_strategy", "add_lesson",
+                                 "pick_up", "rest", "get_briefing", "get_strategy",
+                                 "note_strategy", "merge_lessons", "get_lessons", "write_recipe", "propose_strategy", "add_lesson",
                                  "retract_lesson", "get_items", "note_item",
                                  "retract_item_note"})
         new_game = next(t for t in self.c.request("tools/list")["result"]["tools"]
@@ -497,7 +498,7 @@ class RecordTest(unittest.TestCase):
             m = meta()
             self.assertEqual((m["seed"], m["character_class"], m["difficulty"]), (21, "Dwarf", 1))
             self.assertIsNone(m["outcome"])
-            self.assertEqual(m["skills_version"], 4)   # replays use the matching skill behaviour
+            self.assertEqual(m["skills_version"], 5)   # replays use the matching skill behaviour
 
             c.call("move", direction="e", count=2, thought="Stretching my legs.")
             c.call("send_keys", keys="i")
@@ -631,6 +632,10 @@ class RunStoreTest(unittest.TestCase):
         first = listed["runs"][1]
         self.assertEqual((first["strategy"], first["difficulty"], first["result"]),
                          ("bank-early", 1, "stopped"))
+        # A list gives each game one line; the post-mortem itself is asked for.
+        self.assertEqual(first["takeaway"], "Did not enter the dungeon")
+        self.assertNotIn("synopsis", first)
+        first = json.loads(self.call("list_runs", full=True))["runs"][1]
         self.assertEqual(first["synopsis"], "Never left town.")
         self.assertEqual(first["next_try"][0], "Go straight to the dungeon entrance")
         self.assertEqual(first["deepest"], "town")
