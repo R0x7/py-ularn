@@ -75,6 +75,12 @@ def _not_items():
     return frozenset(ids)
 
 
+def scenery_ids():
+    """Object ids that are not items to pick up (gold is among them: it
+    goes to the purse, not the pack)."""
+    return _not_items()
+
+
 def _enchantable():
     """Ids whose argument is an enchantment (+n): weapons, armour, rings."""
     itm = _engine()[0]

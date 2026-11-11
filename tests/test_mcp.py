@@ -69,7 +69,7 @@ class McpServerTest(unittest.TestCase):
                                  "get_state", "key_reference", "end_game",
                                  "summarize_run", "list_runs", "get_run",
                                  "explore", "travel_to", "take_stairs", "fight", "flee", "buy",
-                                 "get_briefing", "propose_strategy", "add_lesson",
+                                 "pick_up", "rest", "get_briefing", "propose_strategy", "add_lesson",
                                  "retract_lesson", "get_items", "note_item",
                                  "retract_item_note"})
         new_game = next(t for t in self.c.request("tools/list")["result"]["tools"]
@@ -208,16 +208,64 @@ class McpServerTest(unittest.TestCase):
         self.assertEqual(r["result"], "no_monsters")
         r, _ = skill("flee")
         self.assertEqual(r["result"], "safe")
+        r, _ = skill("rest")
+        self.assertEqual((r["result"], r["turns"]), ("rested", 0))   # nothing to recover
+        r, _ = skill("rest", turns=2, thought="Waiting a moment.")
+        self.assertEqual((r["result"], r["turns"]), ("waited", 2))
+        r, _ = skill("pick_up")
+        self.assertEqual((r["result"], r["taken"]), ("not_found", []))  # nothing lies in town
         r, _ = skill("take_stairs", direction="down", thought="Into the dungeon.")
         self.assertEqual((r["result"], r["level"]), ("changed_level", "1"))
 
         for name, args in (("travel_to", {}), ("travel_to", {"target": "nowhere"}),
                            ("travel_to", {"x": 500, "y": 1}), ("fight", {"min_hp": 2}),
                            ("explore", {"max_steps": 0}), ("take_stairs", {"direction": "left"}),
-                           ("buy", {"items": "sword"})):
+                           ("buy", {"items": "sword"}), ("rest", {"until": "mana"}),
+                           ("rest", {"turns": 0}), ("pick_up", {"x": 3}),
+                           ("pick_up", {"target": "stairs_down"})):
             text, err = self.c.call(name, **args)
             self.assertTrue(err, (name, args, text))
             self.assertNotIn("Traceback", text)
+
+    def test_arguments_are_checked(self):
+        self.new_game(character_class="dwarf", seed=7)
+        turn = json.loads(self.c.call("get_state")[0])["turns"]
+
+        # A misspelt option is refused, not dropped, and the nearest name is offered.
+        text, err = self.c.call("explore", ignore_monster=True)
+        self.assertTrue(err, text)
+        self.assertIn("explore has no argument 'ignore_monster'", text)
+        self.assertIn("did you mean 'ignore_monsters'?", text)
+        text, err = self.c.call("send_keys", key="l")
+        self.assertTrue(err, text)
+        self.assertIn("did you mean 'keys'?", text)
+        text, err = self.c.call("get_state", fields="map")
+        self.assertTrue(err, text)
+        self.assertIn("It takes no arguments", text)
+
+        # Values of the wrong type, or out of range, say what was wanted.
+        for name, args, want in (
+                ("move", {"direction": "e", "count": "three"}, "count must be a whole number from 1 to 50"),
+                ("move", {"direction": "e", "count": 500}, "count must be a whole number from 1 to 50"),
+                ("move", {"direction": "e", "run": "yes"}, "run must be true or false"),
+                ("new_game", {"seed": "abc"}, "seed must be a whole number"),
+                ("travel_to", {"target": 5}, "target must be a string"),
+                ("fight", {"min_hp": 1}, "min_hp must be a number from 0 up to 1"),
+                ("buy", {"items": [1, 2]}, "items must be a list of strings"),
+                ("send_keys", {}, "send_keys needs the argument 'keys'")):
+            text, err = self.c.call(name, **args)
+            self.assertTrue(err, (name, args, text))
+            self.assertIn(want, text)
+            self.assertNotIn("Traceback", text)
+        # None of that reached the game.
+        state = json.loads(self.c.call("get_state")[0])
+        self.assertEqual((state["turns"], state["seed"]), (turn, 7))
+
+        # A thought is welcome everywhere, and null means "not given".
+        text, err = self.c.call("get_state", thought="Checking my pack.")
+        self.assertFalse(err, text)
+        text, err = self.c.call("move", direction="e", count=None, thought="One step east.")
+        self.assertFalse(err, text)
 
     def test_run_tools_need_recording(self):
         for tool, args in (("list_runs", {}), ("get_run", {}),
@@ -317,10 +365,10 @@ class DeathTest(unittest.TestCase):
         player.c[player.HP] = player.c[player.HPMAX] = 9000
         x, y = player.playerx + 1, player.playery
 
-        def attacker(mon):
+        def attacker(mon, stealth=dungeon.STEALTH_SEEN | dungeon.STEALTH_AWAKE):
             dungeon.mitem[x][y].mon = mon
             dungeon.hitp[x][y] = 5000
-            dungeon.stealth[x][y] = dungeon.STEALTH_SEEN | dungeon.STEALTH_AWAKE
+            dungeon.stealth[x][y] = stealth
             for _ in range(30):
                 s.send(".")
                 hits = [a for a in s.state()["attacked_by"] if a["turns_ago"] == 0]
@@ -340,6 +388,23 @@ class DeathTest(unittest.TestCase):
         for _ in range(12):
             s.send(".")
         self.assertEqual(s.state()["attacked_by"], [])   # old news is dropped
+
+        # One that has only just turned up attacks before the game has
+        # marked it as seen.  It is in plain view all the same.
+        hit = attacker(monster.JACKAL, stealth=0)
+        self.assertEqual((hit["name"], hit["seen"]), (monster.monster[monster.JACKAL].name, True))
+        self.assertEqual([m["distance"] for m in s.state()["monsters"]], [1])
+        dungeon.mitem[x][y].mon = 0
+        for _ in range(12):
+            s.send(".")
+        # A lemming goes through the motions but never hurts, and the game
+        # says nothing of it: neither does attacked_by.
+        dungeon.mitem[x][y].mon = monster.LEMMING
+        dungeon.hitp[x][y] = 5000
+        dungeon.stealth[x][y] = dungeon.STEALTH_SEEN | dungeon.STEALTH_AWAKE
+        for _ in range(12):
+            s.send(".")
+        self.assertEqual(s.state()["attacked_by"], [])
 
     def test_move_by_game_key(self):
         from pyularn import mcp_server, player
@@ -432,7 +497,7 @@ class RecordTest(unittest.TestCase):
             m = meta()
             self.assertEqual((m["seed"], m["character_class"], m["difficulty"]), (21, "Dwarf", 1))
             self.assertIsNone(m["outcome"])
-            self.assertEqual(m["skills_version"], 3)   # replays use the matching skill behaviour
+            self.assertEqual(m["skills_version"], 4)   # replays use the matching skill behaviour
 
             c.call("move", direction="e", count=2, thought="Stretching my legs.")
             c.call("send_keys", keys="i")
@@ -459,10 +524,26 @@ class RecordTest(unittest.TestCase):
             self.assertGreater(last["result"]["steps"], 0)
             self.assertNotIn("monsters", last["result"])
 
+            # A call the server refuses is kept too, apart from the actions:
+            # the game did not move, but it shows what agents get wrong.
+            text, err = c.call("explore", ignore_monster=True, thought="Off I go.")
+            self.assertTrue(err, text)
+            c.call("fight")                    # the game is asking whether to go in
+            bad = [e for e in events() if e["type"] == "error"]
+            self.assertEqual([(e["tool"], e["after"]) for e in bad], [("explore", 4), ("fight", 4)])
+            self.assertEqual(bad[0]["args"], {"ignore_monster": True, "thought": "Off I go."})
+            self.assertIn("did you mean 'ignore_monsters'?", bad[0]["error"])
+            self.assertIn("asking something", bad[1]["error"])
+            self.assertEqual(bad[1]["turn"], last["s"]["turn"])
+
             c.call("end_game")
             m = meta()
             self.assertEqual(m["outcome"]["result"], "stopped")
-            self.assertEqual(m["actions"], 4)
+            self.assertEqual((m["actions"], m["errors"]), (4, 2))
+            with open(os.path.join(root, run, "summary.md"), encoding="utf-8") as f:
+                summary = f.read()
+            self.assertIn("### Calls the server refused", summary)
+            self.assertIn("1× `fight`: The game is asking something", summary)
             end = events()[-1]
             self.assertEqual(end["type"], "end")
             self.assertEqual(end["outcome"], m["outcome"])

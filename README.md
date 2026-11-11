@@ -82,9 +82,11 @@ Claude Desktop / other clients (`mcpServers` config):
 | `end_game` | Stop the current game. |
 | `explore` | Skill: explore the level until something needs a decision. Option `until` stops when a target is found; `ignore_monsters` walks on past monsters. |
 | `travel_to` | Skill: walk to a `target` (name or map symbol) or to `x`, `y`. Options: `ignore_monsters`, and `through_unknown` to cross cells not yet seen on the way to `x`, `y`. |
+| `pick_up` | Skill: walk to things lying on the level and take them, nearest first: everything known, one kind (`target`), or the thing at `x`, `y`. |
 | `take_stairs` | Skill: go to the known stairs and take them, `direction` `down` or `up`. |
 | `fight` | Skill: attack the nearest visible monster, then only what is next to you, until none is left or HP falls to `min_hp`. |
-| `flee` | Skill: step away from visible monsters until none is within `safe_distance`. |
+| `flee` | Skill: run from visible monsters, by a planned route, until none is within `safe_distance`. |
+| `rest` | Skill: wait until HP is full (`until`: `hp`, `spells` or `both`), or for a set number of `turns`, stopping at the first sign of trouble. |
 | `buy` | Skill: buy `items` at the DND store in town, or return its price list. |
 | `summarize_run` | Write a finished game's post-mortem: `synopsis`, `went_wrong`, `worked`, `next_try`. Needs `--record`. |
 | `list_runs` | Recorded games, newest first, with how each ended and its post-mortem. Filters: `difficulty`, `strategy`, `limit`. Needs `--record`. |
@@ -92,6 +94,13 @@ Claude Desktop / other clients (`mcpServers` config):
 
 Every game has a seed. If `new_game` is not given one it picks one at
 random and reports it in the state, so any game can be replayed.
+
+Arguments are checked against each tool's schema before the call runs. An
+argument the tool does not have is refused, with the nearest name it does
+have (`explore has no argument 'ignore_monster' (did you mean
+'ignore_monsters'?)`), so a misspelt option is never silently dropped and
+the call run with the default. Values of the wrong type or out of range are
+refused the same way. A `thought` is accepted by every tool.
 
 `monsters` lists only what the map already shows (name, symbol, position,
 distance), nearest first. It follows the game's own display rules, so a
@@ -121,11 +130,13 @@ position, HP and the monsters in view.
 
 | Skill | Stops with |
 |---|---|
-| `explore` | `explored` (nothing left to reach), `found` (the `until` target is known) |
-| `travel_to` | `arrived` (a question asked by the destination is left for the agent), `not_found`, `no_path` (with `blocked_by`, the monsters in the only known way, or a `reason`) |
+| `explore` | `explored` (nothing left that a skill can walk to; `beyond` lists known traps with more of the level past them), `no_path` (more is left, but the monsters in `blocked_by` stand in the only known way), `found` (the `until` target is known) |
+| `travel_to` | `arrived` (a question asked by the destination is left for the agent), `not_found`, `no_path` (with what is in the way: `blocked_by`, the monsters; `hazards`, the known traps; or a `reason` saying the known map does not connect) |
+| `pick_up` | `done`, `pack_full`, `not_found` (nothing known to pick up), `no_path` (none of it can be reached). Whatever the result, `taken` lists each thing picked up with its pack slot, and `left` what is still lying there and why |
 | `take_stairs` | `changed_level`, `not_found` (explore first), `refused` |
 | `fight` | `clear`, `no_monsters`, `low_hp` (HP at `min_hp`, or no more than the biggest blow taken so far), `hurt_at_range` (hurt with nothing visible next to you: a breath, a spell or something invisible), `unreachable`, `max_turns` |
-| `flee` | `safe`, `cornered`, `max_steps` |
+| `flee` | `safe`, `cornered` (nowhere you can reach before the monsters is further from them), `blocked`, `max_steps` |
+| `rest` | `rested` (nothing left to recover), `waited` (the `turns` asked for have passed), `max_turns`, `blocked` (on a trap with nowhere to step) |
 | `buy` | `done` (with `bought` and `failed`, each with a reason), `listed`, `refused` (taxes owed) |
 
 Any walking skill also stops with `monster_appeared`, `monster_adjacent`,
@@ -154,13 +165,29 @@ What the skills will and will not do:
 - Once `fight` has killed something it never walks off after another
   target; it only goes on against monsters already next to you. It cannot
   stop a single blow bigger than your HP.
+- `pick_up` only takes. It answers "take" where the game offers it, and
+  stops with `pack_full` when the game will not let you carry more; with a
+  full pack it fetches only gold, and does not walk to the rest. To drink,
+  read or open something where it lies, use `travel_to` and answer the
+  question yourself. With no arguments it takes everything, including
+  what you dropped on the level: it cannot tell the difference.
+- `rest` presses `.` one turn at a time, where a batch of `.` keys would
+  keep passing turns after HP is full or with a monster walking up. It
+  stops when HP drops or a monster comes near, and it will not rest on a
+  known arrow or dart trap, which fires every turn you stand on it: it
+  steps off first.
+- `flee` heads for the place furthest from the monsters in view among the
+  places you can get to before any of them could, and plans again after
+  each step. So it leaves a room by the door where stepping straight away
+  from the monster would back into a corner, and it prefers an unexplored
+  edge of the map to a known dead end. It still knows only what you can
+  see.
 - They will not start while the game is asking a question, or while the
-  character is blind or confused.
+  character is blind or confused (`rest` can: waiting it out is the cure).
 - In town, where every building is there to be found, a skill that needs
   one the player no longer knows of (after a potion of forgetfulness)
   explores until it turns up. Elsewhere an unknown target is `not_found`.
-- `fight` is melee only, and `flee` looks one step ahead, so it can run
-  into a dead end. Spells, potions and scrolls are left to the agent
+- `fight` is melee only. Spells, potions and scrolls are left to the agent
   (`send_keys`).
 
 The code is in `pyularn/skills.py` and can be used without the MCP server:
@@ -193,9 +220,9 @@ game is written to its own folder, `DIR/<date>-<time>-s<seed>/`:
 
 | File | Contents |
 |---|---|
-| `meta.json` | Seed, class, difficulty, start and end time, number of actions and the outcome. |
-| `events.jsonl` | One JSON object per line: `start` (full state), an `action` for each `move` / `send_keys` call (arguments, the agent's `thought`, and HP, position, level and turn afterwards), a full `state` on each level change and every 200 actions, and `end` (outcome, final state and the last 30 screens). |
-| `summary.md` | Written when the game ends: how it ended, the hypotheses it tested, the agent's post-mortem, and what happened (route through the levels, lowest HP, final inventory, last thoughts, final screen). |
+| `meta.json` | Seed, class, difficulty, start and end time, number of actions, number of calls refused (`errors`) and the outcome. |
+| `events.jsonl` | One JSON object per line: `start` (full state), an `action` for each `move` / `send_keys` / skill call (arguments, the agent's `thought`, and HP, position, level and turn afterwards; a skill's `result` too), a full `state` on each level change and every 200 actions, an `error` for each call the server refused or that failed (the tool, its arguments and the message the agent got), and `end` (outcome, final state and the last 30 screens). |
+| `summary.md` | Written when the game ends: how it ended, the hypotheses it tested, the agent's post-mortem, and what happened (route through the levels, lowest HP, final inventory, the calls the server refused, last thoughts, final screen). |
 
 `DIR/INDEX.md` lists every run, newest first, with a count of runs and wins
 per difficulty.

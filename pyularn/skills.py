@@ -14,7 +14,8 @@ Rules every skill follows:
   shows.  It never reads `dungeon.item` or sleeping, unseen monsters.
 * It never walks onto a known trap, pit or teleporter on the way, and it
   answers "ignore" to things it passes over.  Only a prompt at the place it
-  was sent to is left for the agent.
+  was sent to is left for the agent (`pick_up` answers "take" there, which
+  is what it was asked to do).
 * It stops when a monster appears or comes adjacent, when HP drops, when
   the level changes, and when the game asks something it cannot answer.
 
@@ -35,11 +36,23 @@ ESC = "\x1b"
 # targets until HP fell to min_hp.  Version 2 still stopped a walk for
 # every monster in view, however far or walled off, and at every step
 # taken next to one; it did not look for a forgotten building in town.
-VERSION = 3
-LEGACY = False
+# Version 3 had `flee` look one step ahead only.
+VERSION = 4
+BEHAVE = VERSION     # the version whose behaviour is in force; see behave_as
+LEGACY = False       # behaving as a version before 3
+
+
+def behave_as(version=None):
+    """Behave as skills version `version` did, for replaying a run recorded
+    with it.  None goes back to the current behaviour."""
+    global BEHAVE, LEGACY
+    BEHAVE = VERSION if version is None else max(1, min(int(version), VERSION))
+    LEGACY = BEHAVE < 3
+
 
 ALERT_DISTANCE = 6   # a walk stops for a new monster this near, if it can get to you
 COST_UNKNOWN = 4     # walking into the unexplored, when asked to
+COST_HAZARD = 1000   # a known trap, when asking what lies in the way
 FAR = 1 << 30
 
 # (dx, dy) -> movement key.  y grows downwards, as on the screen.
@@ -97,6 +110,38 @@ def gold_ids():
     return _ids("OGOLDPILE", "ODGOLD", "OKGOLD", "OMAXGOLD")
 
 
+def item_ids():
+    """What can be picked up: everything that is not scenery.  Gold counts;
+    walking onto it picks it up without a question."""
+    return (frozenset(range(E.itm.OCOUNT)) - E.items.scenery_ids()) | gold_ids()
+
+
+def captured(fn, *args):
+    """Run one of the game's show.* functions and return what it would have
+    printed on the screen."""
+    import io
+
+    win = E.ularn_win
+    buf = io.StringIO()
+    saved = win.Print, win.Printf, win.Printc, win.Standout
+
+    def p(s):
+        buf.write(str(s))
+
+    def pf(fmt, *a):
+        try:
+            buf.write(fmt % a if a else fmt)
+        except (TypeError, ValueError):
+            buf.write(fmt)
+
+    win.Print, win.Printf, win.Printc, win.Standout = p, pf, p, p
+    try:
+        fn(*args)
+    finally:
+        win.Print, win.Printf, win.Printc, win.Standout = saved
+    return buf.getvalue()
+
+
 def seen(x, y):
     """What the player knows to be at (x, y), as the screen shows it."""
     k = E.dungeon.know[x][y]
@@ -120,6 +165,19 @@ def step_cost(x, y):
     return COST_OBJECT
 
 
+def hidden_kind(k):
+    """Whether the screen would not show a monster of kind `k` even in
+    plain view: the player is blind, it is an invisible stalker (without
+    see invisible) or a demon (without the Eye of Larn)."""
+    monster, player = E.monster, E.player
+    c = player.c
+    if c[player.BLINDCOUNT]:
+        return True
+    if k == monster.INVISIBLESTALKER and c[player.SEEINVISIBLE] == 0:
+        return True
+    return monster.DEMONLORD <= k <= monster.LUCIFER and c[player.EYEOFLARN] == 0
+
+
 def visible_monsters():
     """The monsters drawn on the map right now, nearest first.
 
@@ -141,9 +199,7 @@ def visible_monsters():
                 continue
             if not dungeon.stealth[x][y] & (dungeon.STEALTH_SEEN | dungeon.STEALTH_AWAKE):
                 continue
-            if k == monster.INVISIBLESTALKER and c[player.SEEINVISIBLE] == 0:
-                continue
-            if monster.DEMONLORD <= k <= monster.LUCIFER and c[player.EYEOFLARN] == 0:
+            if hidden_kind(k):
                 continue
             if k == monster.MIMIC:
                 k = E.ularn_win.mimicmonst or monster.MIMIC
@@ -245,7 +301,7 @@ def target_ids(target):
 
 # ====================================================================== paths
 
-def reach(start, goal=None, avoid=(), through_unknown=False):
+def reach(start, goal=None, avoid=(), through_unknown=False, hazards=False):
     """Cheapest walking cost from `start` to every cell a skill may enter
     (Dijkstra over the known map).  Returns (cost, came_from).
 
@@ -254,8 +310,11 @@ def reach(start, goal=None, avoid=(), through_unknown=False):
     monster or a trap the agent chose to walk onto.  With `through_unknown`
     unexplored cells may be crossed, at a cost, on the guess that they are
     floor: the walk plans again as each step shows more of the map.
+    `hazards` lets the path cross known traps, at a high cost.  No skill
+    walks such a path: it is for saying what lies in the way.
     """
     itm = E.itm
+    danger = hazard_ids() if hazards else ()
     cost = {start: 0}
     came = {}
     heap = [(0, start)]
@@ -282,6 +341,8 @@ def reach(start, goal=None, avoid=(), through_unknown=False):
                 step = COST_UNKNOWN
             else:
                 step = step_cost(*nxt)
+                if step is None and danger and seen(*nxt) in danger:
+                    step = COST_HAZARD
             if step is None:
                 continue
             nd = d + step
@@ -353,8 +414,10 @@ class Runner:
     def monster_cells(self):
         return {(m["x"], m["y"]) for m in visible_monsters()}
 
-    def check_ready(self):
-        """Refuse to start unless the game is waiting for a command."""
+    def check_ready(self, impaired=False):
+        """Refuse to start unless the game is waiting for a command.  A
+        skill that does not walk (rest) passes `impaired`, to be usable
+        while blind or confused."""
         if self.over():
             raise SkillError("The game is over.")
         for _ in range(5):  # "press space to continue" needs no decision
@@ -364,6 +427,8 @@ class Runner:
             raise SkillError("The game is over.")
         if self.kind() != "command":
             raise SkillError("The game is asking something. Answer it with send_keys first.")
+        if impaired:
+            return
         c = E.player.c
         if c[E.player.BLINDCOUNT]:
             raise SkillError("You are blind and cannot see the map. Wait it out or cure it.")
@@ -508,7 +573,7 @@ def _walk(r, max_steps, next_goal, arrived, ignore_monsters=False, through_unkno
         _, came = reach(start, goal, r.monster_cells(), through_unknown)
         cells = path_to(came, start, goal)
         if not cells:
-            _explain_no_path(r, start, goal)
+            _explain_no_path(r, start, goal, through_unknown)
             return "no_path"
         guess = through_unknown and seen(*cells[0]) == E.itm.OUNKNOWN
         last = cells[0] == goal and arrived(goal)
@@ -556,19 +621,58 @@ def _off_trap(r):
                               "note": "you are standing on a trap that hurts every turn; step off"}
 
 
-def _explain_no_path(r, start, goal):
-    """Say why there is no path: monsters in the way, or a map that does not
-    connect (unexplored cells or known traps between here and there)."""
-    _, came = reach(start, goal)
+def _explain_no_path(r, start, goal, through_unknown=False):
+    """Say why there is no path: monsters in the way, a known trap in the
+    way, or a map that does not connect yet."""
+    _, came = reach(start, goal, (), through_unknown)
     cells = path_to(came, start, goal)
     if cells:
         on_path = set(cells)
         blockers = [m for m in visible_monsters() if (m["x"], m["y"]) in on_path]
         r.notes["blocked_by"] = blockers
         r.notes["reason"] = "the only known way is through the monsters in blocked_by"
+        return
+    _, came = reach(start, goal, (), through_unknown, hazards=True)
+    crossed = _hazards_on((path_to(came, start, goal) or [])[:-1])
+    if crossed:
+        r.notes["hazards"] = crossed
+        r.notes["reason"] = ("the only known way crosses what is listed in hazards, which "
+                             "skills will not walk over: cross it yourself with move, or "
+                             "explore for another way")
     else:
-        r.notes["reason"] = ("the known map does not connect here: explore more, or the way "
-                             "is through a known trap or elevator, which skills will not cross")
+        r.notes["reason"] = "the known map does not connect here: explore more"
+
+
+def _hazards_on(cells):
+    """The known traps, pits, teleporters and express elevators among `cells`."""
+    danger = hazard_ids()
+    return [{"name": E.itm.objectname[seen(x, y)].strip(), "x": x, "y": y}
+            for x, y in cells or () if seen(x, y) in danger]
+
+
+def _unreached(r, start):
+    """Explore has nowhere left to walk to.  Returns "explored", or
+    "no_path" when more of the level is known to lie behind monsters; what
+    lies past a known trap is noted, since a skill will not cross one."""
+    def nearest_edge(cost):
+        edge = [c for c in cost if c != start and is_frontier(*c)]
+        return min(edge, key=lambda c: (cost[c], c[1], c[0])) if edge else None
+
+    cost, came = reach(start)                     # monsters not stepped round
+    goal = nearest_edge(cost)
+    if goal is not None:
+        on_path = set(path_to(came, start, goal))
+        r.notes["blocked_by"] = [m for m in visible_monsters() if (m["x"], m["y"]) in on_path]
+        r.notes["reason"] = ("there is more to explore, but the only known way to it is "
+                             "through the monsters in blocked_by")
+        return "no_path"
+    cost, came = reach(start, hazards=True)
+    goal = nearest_edge(cost)
+    if goal is not None:
+        r.notes["beyond"] = _hazards_on(path_to(came, start, goal))
+        r.notes["note"] = ("explored as far as skills go: more of the level lies past what "
+                           "is listed in beyond, which they will not walk over")
+    return "explored"
 
 
 def nearest(ids):
@@ -643,8 +747,10 @@ def explore(session, max_steps=300, until=None, ignore_monsters=False):
 
     `until` is a target name or map symbol: stop with "found" as soon as one
     is known.  `ignore_monsters` is as for travel_to.  Results: explored
-    (nothing left to reach), found, plus the interruptions of travel_to.
-    The report lists what was discovered.
+    (nothing left to reach; `beyond` lists known traps with more of the
+    level past them), no_path (more is left, behind the monsters in
+    `blocked_by`), found, plus the interruptions of travel_to.  The report
+    lists what was discovered.
     """
     r = Runner(session)
     r.check_ready()
@@ -686,7 +792,7 @@ def _explore(r, max_steps, wanted=None, ignore_monsters=False):
                     return "prompt"
                 return next_goal()
             if not frontier:
-                return "explored"
+                return _unreached(r, start)
             target = state["target"] = min(frontier, key=lambda c: (cost[c], c[1], c[0]))
         return target
 
@@ -762,6 +868,244 @@ def take_stairs(session, direction="down", volcano=False, max_steps=300, ignore_
     return r.report("refused", note="see the screen for the reason")
 
 
+def _pack_line(index):
+    """An inventory line as the game prints it, split into slot and name."""
+    text = captured(E.show.show3, index).strip()
+    slot, sep, name = text.partition(")")
+    if sep and len(slot) == 1:
+        return {"slot": slot, "name": name.strip()}
+    return {"slot": chr(ord("a") + index), "name": text}
+
+
+def pick_up(session, target=None, x=None, y=None, max_steps=300, ignore_monsters=False):
+    """Walk to things lying on the level and take them.
+
+    With `x` and `y`, the one thing at that cell.  With `target` (a name
+    such as potion, or a map symbol), every known one of that kind.  With
+    neither, everything known on the level that can be carried, gold
+    included (and anything you dropped there: it cannot tell).  The nearest
+    is fetched first.  Results: done, pack_full, not_found (nothing known
+    to pick up), no_path (none of it can be reached), plus the
+    interruptions of travel_to.  Whatever the result, `taken` lists what
+    was picked up and `left` what is still lying there and why.  With a
+    full pack it does not walk to what it could not carry.
+    """
+    itm, player = E.itm, E.player
+    r = Runner(session)
+    r.check_ready()
+    carried = item_ids()
+    if x is not None or y is not None:
+        if x is None or y is None:
+            raise SkillError("give both x and y")
+        if target is not None:
+            raise SkillError("give a target, or x and y, not both")
+        if not in_bounds(x, y):
+            raise SkillError("(%s, %s) is off the map" % (x, y))
+        wanted, only = carried, (x, y)
+    else:
+        wanted, only = (carried if target is None else target_ids(target) & carried), None
+        if not wanted:
+            raise SkillError("%r is not something to pick up" % (target,))
+
+    def name_at(cell):
+        return itm.objectname[seen(*cell)].strip()
+
+    def known():
+        if only is not None:
+            return [only] if seen(*only) in wanted else []
+        return [(cx, cy) for cx in range(E.dungeon.MAXX) for cy in range(E.dungeon.MAXY)
+                if seen(cx, cy) in wanted]
+
+    level = E.dungeon.level
+    gold = player.c[player.GOLD]
+    purse = gold_ids()
+    taken, left = [], {}
+    result = None
+    while result is None:
+        start = r.pos()
+        todo = [c for c in known() if c not in left]
+        if not _pack_has_room() and any(seen(*c) not in purse for c in todo):
+            # Do not walk to what cannot be carried; gold still can be.
+            todo = [c for c in todo if seen(*c) in purse]
+            if not todo:
+                result = "pack_full"
+                break
+        if not todo:
+            break
+        occupied = r.monster_cells()
+        cost, _ = reach(start, None, occupied)
+        near = [c for c in todo if c in cost]
+        if len(near) < len(todo):
+            past_monsters, _ = reach(start)
+            past_traps, _ = reach(start, hazards=True)
+            for cell in todo:
+                if cell in cost:
+                    continue
+                if cell in occupied:
+                    why = "a monster is standing on it"
+                elif cell in past_monsters:
+                    why = "monsters stand in the only known way there"
+                elif cell in past_traps:
+                    why = "the only known way there crosses a known trap"
+                else:
+                    why = "no known way there"
+                left[cell] = {"name": name_at(cell), "x": cell[0], "y": cell[1], "why": why}
+        if not near:
+            continue
+        # Nearest by the walk up to it: the price of stepping onto a thing is
+        # for walks that want to pass it by, and this one is going to it.
+        goal = min(near, key=lambda c: (cost[c] - (step_cost(*c) or 0) if c != start else 0,
+                                        c[1], c[0]))
+        what = name_at(goal)
+        if goal == start:
+            # Standing on it with no question showing: step off and come back.
+            if not _step_aside(r):
+                left[goal] = {"name": what, "x": goal[0], "y": goal[1],
+                              "why": "no room to step off it and back on"}
+            continue
+        walked = _walk(r, max_steps, lambda: goal, lambda cell: True, ignore_monsters)
+        if walked == "no_path":       # something moved into the way: try the rest
+            why = r.notes.pop("reason", "no known way there")
+            r.notes.pop("blocked_by", None)
+            r.notes.pop("hazards", None)
+            left[goal] = {"name": what, "x": goal[0], "y": goal[1], "why": why}
+            continue
+        if walked != "arrived":
+            result = walked
+            break
+        entry = {"name": what, "x": goal[0], "y": goal[1]}
+        if r.kind() == "prompt" and "t" in r.answers():
+            before = list(player.iven)
+            r.press("t")
+            answered = r.clear_prompts()
+            if r.over():
+                result = "game_over"
+            elif E.dungeon.level != level:
+                result = "level_changed"
+            else:
+                new = [i for i in range(player.IVENSIZE)
+                       if before[i] == itm.ONOTHING and player.iven[i] != itm.ONOTHING]
+                if new:
+                    entry.update(_pack_line(new[0]))
+                    taken.append(entry)
+                elif seen(*goal) in carried:
+                    result = "pack_full"      # the game would not let you take it
+                if result is None and not answered:
+                    result = "prompt"
+        elif r.kind() == "command":
+            if seen(*goal) in carried:
+                left[goal] = dict(entry, why="the game did not offer to take it")
+            else:                             # gold: taken by walking onto it
+                taken.append(entry)
+        else:
+            r.notes["note"] = "the %s asked something other than whether to take it" % what
+            result = "prompt"
+
+    out = {"taken": taken}
+    if not r.over() and E.dungeon.level == level:
+        if result is None and not _pack_has_room() \
+                and any(seen(*c) not in purse and c not in left for c in known()):
+            result = "pack_full"      # the gold was fetched; the rest cannot be carried
+        # Whatever is still lying there, and why it was not fetched.
+        for cell in known():
+            if cell in left:
+                continue
+            if result == "pack_full" and seen(*cell) not in purse:
+                why = "your pack is full"
+            else:
+                why = "not reached: stopped first (%s)" % result
+            left[cell] = {"name": name_at(cell), "x": cell[0], "y": cell[1], "why": why}
+    if left:
+        out["left"] = sorted(left.values(), key=lambda o: (o["y"], o["x"]))[:30]
+    if not r.over():
+        if player.c[player.GOLD] > gold:
+            out["gold_gained"] = player.c[player.GOLD] - gold
+        if result == "pack_full":
+            out["note"] = "you can carry no more: drop or use something first"
+    if result is None:
+        result = "done" if taken else ("no_path" if left else "not_found")
+    return r.report(result, **out)
+
+
+def _pack_has_room():
+    """Whether the game would let you take one more thing: the slots it
+    lets you use grow with your level (see player.take)."""
+    player = E.player
+    slots = min(15 + (player.c[player.LEVEL] >> 1), player.IVENSIZE)
+    return any(player.iven[i] == E.itm.ONOTHING for i in range(slots))
+
+
+def rest(session, turns=None, until="hp", max_turns=200, ignore_monsters=False):
+    """Wait a turn at a time, watching for trouble.
+
+    Without `turns`, rests until HP is full (`until` "hp"), spell points
+    are (`until` "spells"), or both are (`until` "both"), for at most
+    `max_turns`.  With `turns`, waits that many turns whatever HP is, to
+    let an effect wear off, say.  It stops at once when HP drops or a
+    monster comes into view or next to you, and it will not rest on a
+    known trap that fires every turn: it steps off first.  It can be used
+    while blind or confused.  Results: rested (nothing left to recover),
+    waited (the `turns` asked for have passed), max_turns, blocked (on a
+    trap with nowhere to step), plus the interruptions of travel_to.
+    """
+    player = E.player
+    c = player.c
+    if until not in ("hp", "spells", "both"):
+        raise SkillError("until must be hp, spells or both")
+    r = Runner(session)
+    r.check_ready(impaired=True)
+
+    def lacking():
+        hp = c[player.HP] < c[player.HPMAX]
+        spells = c[player.SPELLS] < c[player.SPELLMAX]
+        return {"hp": hp, "spells": spells, "both": hp or spells}[until]
+
+    turn, hp, spells = player.gtime, c[player.HP], c[player.SPELLS]
+
+    def done(result, **extra):
+        out = {"turns": player.gtime - turn}
+        if not r.over():
+            out.update(hp_gained=c[player.HP] - hp, spells=c[player.SPELLS],
+                       spells_max=c[player.SPELLMAX], spells_gained=c[player.SPELLS] - spells)
+        out.update(extra)
+        return r.report(result, **out)
+
+    if turns is None and not lacking():
+        return done("rested", note="nothing to recover")
+    if seen(*r.pos()) in trap_ids():
+        trap = r.pos()
+        if not _step_aside(r):
+            return done("blocked", on_trap={"x": trap[0], "y": trap[1]},
+                        note="you are standing on a trap that hurts every turn, with no "
+                             "free cell to step to: move off it before resting")
+        r.notes["stepped_off_trap"] = {"x": trap[0], "y": trap[1]}
+    watch = Watch(r, ignore_monsters)
+    limit = max_turns if turns is None else turns
+    waited = 0
+    result = "max_turns" if turns is None else "waited"
+    while waited < limit:
+        r.press(".")
+        r.steps += 1
+        waited += 1
+        answered = r.clear_prompts()
+        why = watch.reason()
+        if why in FATAL:
+            result = why
+            break
+        if why == "hurt":
+            _off_trap(r)
+        if not answered:
+            result = "prompt"
+            break
+        if why:
+            result = why
+            break
+        if turns is None and not lacking():
+            result = "rested"
+            break
+    return done(result)
+
+
 def fight(session, max_turns=40, min_hp=0.35, reach_distance=5):
     """Attack the nearest visible monster, and then whatever is next to you.
 
@@ -782,8 +1126,8 @@ def fight(session, max_turns=40, min_hp=0.35, reach_distance=5):
     r.check_ready()
     level = E.dungeon.level
     exp = player.c[player.EXPERIENCE]
-    hp = last_hp = r.hp()
-    worst = 0
+    last_hp = r.hp()
+    worst = hurt = 0
     result = "max_turns"
     while r.steps < max_turns:
         if r.over():
@@ -794,6 +1138,7 @@ def fight(session, max_turns=40, min_hp=0.35, reach_distance=5):
             break
         now = r.hp()
         lost, last_hp = last_hp - now, now
+        hurt += max(0, lost)
         mons = visible_monsters()
         if lost > 0 and not LEGACY:
             worst = max(worst, lost)
@@ -825,19 +1170,121 @@ def fight(session, max_turns=40, min_hp=0.35, reach_distance=5):
             break
     out = {"turns": r.steps}
     if not r.over():
-        out.update(experience_gained=player.c[player.EXPERIENCE] - exp, hp_lost=hp - r.hp(),
+        # The blows taken, added up: HP at the end less HP at the start
+        # would come out negative when a kill raised the character's level.
+        hurt += max(0, last_hp - r.hp())
+        out.update(experience_gained=player.c[player.EXPERIENCE] - exp, hp_lost=hurt,
                    biggest_hit=worst)
     return r.report(result, **out)
 
 
 def flee(session, max_steps=20, safe_distance=8):
-    """Step away from the visible monsters, one cell at a time.
+    """Run from the visible monsters.
 
-    Each step goes to the neighbouring cell that is furthest, by walking
-    distance, from any monster.  It only looks one step ahead, so it can run
-    into a dead end.  Results: safe (no monster within `safe_distance`),
-    cornered, max_steps, prompt, level_changed, teleported, game_over.
+    Heads for the place furthest, by walking distance, from every monster
+    in view, among the places you can get to before any of them could, and
+    plans again after each step as they move.  So it leaves a room by the
+    door instead of backing into a corner, and it would sooner run for an
+    unexplored edge of the map than into a known dead end.  It knows only
+    the map and the monsters you can see.  Results: safe (no monster within
+    `safe_distance`, or none with a known way to you), cornered (nowhere
+    you can reach first is further from them than here), blocked, max_steps,
+    prompt, level_changed, game_over.  The report says where it was heading
+    (`toward`).
     """
+    if BEHAVE < 4:
+        return _flee_one_step(session, max_steps, safe_distance)
+    r = Runner(session)
+    r.check_ready()
+    level = E.dungeon.level
+    result = "max_steps"
+    target = None
+    stuck = 0
+    while r.steps < max_steps:
+        if r.over():
+            result = "game_over"
+            break
+        if E.dungeon.level != level:
+            result = "level_changed"
+            break
+        mons = visible_monsters()
+        if not mons or mons[0]["distance"] >= safe_distance:
+            result = "safe"
+            break
+        occupied = {(m["x"], m["y"]) for m in mons}
+        far = _monster_distance(occupied)
+        here = r.pos()
+        if here not in far:
+            r.notes["note"] = "no monster in view has a known way to you"
+            result = "safe"
+            break
+        steps, came = _reach_first(here, occupied, far)
+
+        def worth(cell):
+            # How far from the monsters, and an edge of the known map counts
+            # for more than a known dead end as far away: there is probably
+            # more room past it, and the map fills in on the way there.
+            return far.get(cell, FAR) + (safe_distance if is_frontier(*cell) else 0)
+
+        best = max(steps, key=lambda c: (worth(c), -steps[c], -c[1], -c[0]))
+        if target in steps and target != here and worth(target) >= worth(best) - 2:
+            best = target       # keep going where you were going
+        if best == here or worth(best) <= worth(here):
+            result = "cornered"
+            break
+        target = best
+        cell = path_to(came, here, best)[0]
+        if not r.step(cell):
+            result = "prompt"
+            break
+        if not r.over() and E.dungeon.level == level and r.pos() == here:
+            stuck += 1
+            if seen(*cell) != E.itm.OCLOSEDDOOR:
+                r.notes["note"] = ("could not step to (%d, %d): something you cannot see "
+                                   "is probably there, and moving into it attacks it" % cell)
+                result = "blocked"
+                break
+            if stuck >= 4:
+                r.notes["note"] = "the door at (%d, %d) would not open" % cell
+                result = "blocked"
+                break
+        else:
+            stuck = 0
+    extra = {"toward": {"x": target[0], "y": target[1]}} if target else {}
+    return r.report(result, **extra)
+
+
+def _reach_first(start, occupied, far):
+    """The cells you can walk to before any monster could, with the steps
+    each takes: (steps, came_from).  `far` is each cell's walking distance
+    from the nearest monster; a cell is only entered while that is more
+    than the steps it takes you to get there."""
+    steps = {start: 0}
+    came = {}
+    heap = [(0, start)]
+    while heap:
+        d, cell = heapq.heappop(heap)
+        if d > steps[cell]:
+            continue
+        for dx, dy in STEPS:
+            nxt = (cell[0] + dx, cell[1] + dy)
+            if not in_bounds(*nxt) or nxt in occupied:
+                continue
+            price = step_cost(*nxt)
+            if price is None:
+                continue
+            nd = d + (2 if price == COST_DOOR else 1)    # a door takes a turn to open
+            if nd >= far.get(nxt, FAR) or nd >= steps.get(nxt, FAR):
+                continue
+            steps[nxt] = nd
+            came[nxt] = cell
+            heapq.heappush(heap, (nd, nxt))
+    return steps, came
+
+
+def _flee_one_step(session, max_steps, safe_distance):
+    """flee as it was up to skills version 3: each step goes to the
+    neighbouring cell furthest from any monster, looking no further ahead."""
     r = Runner(session)
     r.check_ready()
     level = E.dungeon.level

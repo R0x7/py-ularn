@@ -96,7 +96,7 @@ def rebuild(run_dir, log=None):
         if meta.get("difficulty") is not None:
             args["difficulty"] = meta["difficulty"]
         # Skills recorded before the current skills_version behaved differently.
-        skills.LEGACY = (meta.get("skills_version") or 1) < skills.VERSION
+        skills.behave_as(meta.get("skills_version") or 1)
         ms.tool_new_game(args)
         want, got = compact_state(events[0]["state"]), compact_state(session.state())
         if want != got:
@@ -126,7 +126,7 @@ def rebuild(run_dir, log=None):
             if log and report["replayed"] % 500 == 0:
                 log("  %d / %d actions" % (report["replayed"], len(actions)))
     finally:
-        skills.LEGACY = False
+        skills.behave_as()
         session.stop()
         session.record_dir, session.watch, session.spectator = saved[:3]
         for name, value in (("PYULARN_HOME", saved[3]), ("USER", saved[4])):
