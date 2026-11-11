@@ -88,8 +88,8 @@ Claude Desktop / other clients (`mcpServers` config):
 | `flee` | Skill: run from visible monsters, by a planned route, until none is within `safe_distance`. |
 | `rest` | Skill: wait until HP is full (`until`: `hp`, `spells` or `both`), or for a set number of `turns`, stopping at the first sign of trouble. |
 | `buy` | Skill: buy `items` at the DND store in town, or return its price list. |
-| `summarize_run` | Write a finished game's post-mortem: `synopsis`, `went_wrong`, `worked`, `next_try`. Needs `--record`. |
-| `list_runs` | Recorded games, newest first, with how each ended and its post-mortem. Filters: `difficulty`, `strategy`, `limit`. Needs `--record`. |
+| `summarize_run` | Write a finished game's post-mortem: a one-sentence `takeaway`, then `synopsis`, `went_wrong`, `worked`, `next_try`. Needs `--record`. |
+| `list_runs` | Recorded games, newest first, with how each ended and its one-line takeaway (`full` adds the synopsis and the rest). Filters: `difficulty`, `strategy`, `limit`. Needs `--record`. |
 | `get_run` | One recorded game's full summary. Needs `--record`. |
 
 Every game has a seed. If `new_game` is not given one it picks one at
@@ -236,7 +236,8 @@ people as `CAMPAIGN.md`.
 - **Playbook.** Lessons, each citing the runs that showed it. A lesson is
   `tentative` when seen once and `confirmed` when more than one run agrees.
   A lesson found to be wrong is retracted, not deleted, so it is not
-  learned again by mistake.
+  learned again by mistake. A lesson is one short instruction with a
+  topic, and the playbook has a size budget: see "Keeping it short" below.
 - **Strategy tree.** Every strategy is a proven strategy plus one change,
   so the effect of that change shows when the two are compared. The root,
   `S1`, is a baseline with no fixed plan.
@@ -244,6 +245,97 @@ people as `CAMPAIGN.md`.
   scored on how far it got: 1 point per dungeon level, 2 per volcano level,
   10 for holding the cure, 30 for winning. A strategy's results are worked
   out from its recorded games and are never stored separately.
+
+#### Keeping it short
+
+Every agent starts from nothing but the briefing, so what it carries has to
+stay small as the games pile up. Three things are distilled as play goes
+on, so that nobody has to read the games one by one:
+
+- **A game, in one line.** `summarize_run` takes a `takeaway`: one sentence
+  (at most 200 characters) on what ended the game and the decision that
+  would have changed it. Lists of games show only that. A game written up
+  without one shows the first thing that went wrong.
+- **A strategy, in one page.** `get_strategy` gives a strategy whole: what
+  it changes, its numbers, its field notes and a line for each of its
+  games. The briefing carries the same for the strategy about to be
+  played and the ones it builds on.
+  - The numbers are worked out from the recordings: games, wins, how often
+    the cure was held, average progress, what ended the games and on which
+    levels, and how long a game lasted.
+  - The field notes are the agents' own account of how the strategy plays,
+    how it dies and what to do differently, in at most 1,200 characters.
+    After its game each agent rewrites them whole with `note_strategy`
+    (`summarize_run` shows them as they stand), so they stay one short text
+    however many games are played. Earlier versions are kept in
+    `campaign.json`. The notes say how many of the strategy's games they
+    cover, so stale ones show.
+- **The playbook, within a budget.** A lesson is at most 300 characters and
+  has a topic of a word or two (`dragons`, `volcano`, `town`).
+  `merge_lessons` folds lessons that overlap into one, which carries all
+  their evidence and so is confirmed once more than one run stands behind
+  it; with a single id it rewrites a lesson. The originals stay on record
+  as merged. `get_lessons` looks a subject up.
+
+  The playbook's budget is the `playbook_budget` rule (12,000 characters by
+  default). While it is over, the briefing says so, and it lists the
+  lessons seen only once under their topics, to be read with `get_lessons`
+  when the subject comes up, instead of carrying their text. Confirmed
+  lessons, and any lesson not yet given a topic, are always carried in
+  full.
+
+The field notes are only as good as the agent that rewrote them, which is
+why the computed numbers sit beside them and the earlier versions are kept.
+
+A game started under a name that is not one of the campaign's strategies
+counts towards none of them, and `new_game` says so. A slip such as
+`S1 Baseline` for `S1` is read as the strategy.
+
+#### After a win
+
+A won game shows that its strategy can win, but the how is in that one
+game. So a win is turned into a strategy of its own, a **winning line**,
+which later games follow and correct:
+
+1. **The run sheet.** Every game's `summary.md` (and so `get_run`) has a
+   table of what the character was on first reaching each level: turn,
+   character level, HP, AC, WC, gold, spells, and what was worn and
+   wielded. Under it are the shopping, trip by trip, the spells in the
+   order learned, when the cure was taken and the levels passed on the way
+   home. It is worked out from the recording, for won games and lost ones
+   alike.
+2. **The line.** When a game is won under an ordinary strategy, the
+   campaign makes a new strategy that follows it: a child of that strategy,
+   with the winner's class, the won game as its model, and seeds of its own
+   that nobody has played. It is played next, ahead of everything else.
+3. **The recipe.** Writing the win up, `summarize_run` asks for the line's
+   recipe and shows the run sheet to write it from; `write_recipe` saves it
+   (2,500 characters at most). A recipe is the plan in stages: what to do
+   in each, what to buy or learn, what to have before going on, in numbers,
+   and the killers met with the answer to each. Nothing about where things
+   lay on that map. The briefing for a line carries its recipe and the
+   winner's run sheet, to measure oneself against level by level.
+4. **Revision.** After each game under the line, `summarize_run` sets that
+   game beside the one that won, level by level, names the first place it
+   fell behind, and asks for the recipe to be rewritten whole. Earlier
+   versions are kept.
+5. **The verdict.** A line is judged on wins, not on average progress. It
+   is proven, and becomes the base, as soon as it wins on one of its unseen
+   seeds. If it plays them all (as many as a trial has games) and wins
+   none, it is abandoned: the win it followed was not one it could repeat.
+   A second win under the same strategy while its line is being tried
+   joins the line as another game to follow.
+
+One win is one sample, and part of any win is what the dungeon happened to
+hand out, so a first recipe is over-fitted. What makes a line worth
+following is step 4 on seeds nobody has played: each game knocks out a part
+that was luck.
+
+**A seed already won does not count again.** Games are deterministic, so a
+won seed can be won again by sending the same keys, which shows nothing
+about the strategy. A win on a seed that an earlier game won at that
+difficulty is not counted as a win by the ladder, makes no line, and is
+scored as a game that held the cure when strategies are compared.
 
 #### Trying, keeping and backing out of strategies
 
@@ -314,17 +406,25 @@ The server asks agents to follow this loop:
 2. `new_game` with that `strategy`. The game takes its hypotheses, class,
    seed and difficulty from the strategy.
 3. Play to the end.
-4. `summarize_run`: a `synopsis`, what `went_wrong`, what `worked` and what
-   the next game will try (`next_try`).
-5. `add_lesson` for what the game showed (`retract_lesson` for a lesson it
-   disproved), and `propose_strategy` if there is one specific change worth
-   testing next.
+4. `summarize_run`: a one-sentence `takeaway`, a `synopsis`, what
+   `went_wrong`, what `worked` and what the next game will try
+   (`next_try`). Then `note_strategy`, to bring the strategy's field notes
+   up to date.
+5. `add_lesson` for what the game showed that the playbook does not already
+   say (`merge_lessons` where it overlaps a lesson that is there,
+   `retract_lesson` for a lesson it disproved), and `propose_strategy` if
+   there is one specific change worth testing next.
 
 | Tool | What it does |
 |---|---|
 | `get_briefing` | What to read before a game; starts the campaign if there is none. A long briefing comes in pages: its first line says how many, and `page` asks for the next. |
+| `get_strategy` | One `strategy` whole: what it changes, its numbers, its field notes, and a line for each of its games. |
+| `note_strategy` | Rewrite a `strategy`'s field notes (`text`, at most 1,200 characters). |
+| `write_recipe` | Write or rewrite the recipe of a winning line (`text`, at most 2,500 characters; `strategy` defaults to the line this session's game belongs to). |
 | `propose_strategy` | Put a strategy on trial: `title`, the one `change`, optional `parent`, `character_class` and `retry_reason`. |
-| `add_lesson` | Add a lesson: `text`, `evidence` (run ids), `confidence`. |
+| `add_lesson` | Add a lesson: `text` (at most 300 characters), `topic`, `evidence` (run ids), `confidence`. |
+| `merge_lessons` | Replace `lesson_ids` with one lesson (`text`, optional `topic`) that carries their evidence. |
+| `get_lessons` | The lessons in full, all of them or those `about` a topic or word. |
 | `retract_lesson` | Mark lesson `lesson_id` as wrong, with a `reason`. |
 
 #### Running the loop
@@ -345,6 +445,16 @@ an MCP server; `{prompt}` and `{mcp_config}` in it are replaced. Other
 options: `--model`, `--max-budget-usd` (a spending cap per game),
 `--timeout`, `--watch PORT` for the live page, and `--difficulty` for a new
 campaign.
+
+Before the first game the coach checks whether the campaign needs tidying:
+a playbook over its budget, lessons with no topic, a strategy that has
+been played but has no field notes, or a winning line with no recipe. If so it first starts one agent as an
+editor, which plays no game: it merges and shortens lessons until the
+playbook fits, and writes the missing notes from the strategy's games.
+`pyularn-coach --tidy` runs the editor alone, and `--no-tidy` skips it. A
+new campaign's budget is set with `--playbook-budget`. The editor runs at
+most once per invocation; if it does not finish, the coach says what is
+left and play goes on.
 
 The coach writes each agent's output to `DIR/coach-logs/` and prints every
 decision the campaign makes as it happens. It stops after the cycles asked

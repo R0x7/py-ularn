@@ -43,6 +43,47 @@ Play one game only. Do not ask questions: nobody is there to answer. \
 Narrate with the `thought` argument as you go. When the cycle is done, \
 reply with two or three sentences on how the game went."""
 
+EDITOR_PROMPT = """\
+You are the editor of a learning campaign for the roguelike Ularn, kept \
+through the pyularn MCP tools. Agents play one game each and learn only \
+from what the campaign folder tells them, so what it tells them has to be \
+short and right. Do not start a game. Do not ask questions: nobody is \
+there to answer. Your jobs today:
+
+%s
+
+How to do them:
+
+The playbook. Read all of it with get_lessons (every page). Lessons that \
+say the same thing, or parts of one thing, become one: call merge_lessons \
+with their ids and the single lesson that replaces them. It carries their \
+evidence, so nothing is lost by merging. A merged lesson is one \
+instruction a later game can act on, at most 300 characters: keep the \
+numbers that matter, leave out how it was found, and leave out anything \
+about where things lie on one particular map. A lesson that stands alone \
+but is too long, or has no topic, is rewritten the same way with only its \
+own id. Give every lesson a topic of a word or two and use few of them, \
+ten to twenty in all, so that everything about dragons, say, is found \
+under one. Never drop a lesson because it is inconvenient: retract_lesson \
+is only for one the games have shown to be wrong. Stop when get_lessons \
+reports the playbook within its budget and no lesson is without a topic.
+
+Field notes. For each strategy named above, call get_strategy, read its \
+games (get_run gives one in full when its line is not enough), and write \
+its notes with note_strategy: how the strategy plays, how it dies, and \
+what to do differently, in at most 1,200 characters. Write what holds \
+across its games, not the story of one.
+
+A recipe. A winning line follows a game that was won; its recipe is the \
+staged plan later agents play from. For each one named above, read the \
+won game with get_run (its run sheet shows what the winner was on \
+reaching each level, what it bought and how it got home), then write the \
+recipe with write_recipe, giving the line's id: the stages in order, what \
+to have before leaving each in numbers, and the killers with the answer \
+to each. Nothing about where things lay on that map.
+
+When you are done, reply with two or three sentences on what you changed."""
+
 DEFAULT_AGENT = ("claude -p {prompt} --mcp-config {mcp_config} --strict-mcp-config "
                  "--allowedTools mcp__pyularn")
 
@@ -70,13 +111,44 @@ def agent_command(template, prompt, mcp_config, extra=()):
     return words + list(extra)
 
 
-def run_cycle(root, number, command, timeout, out=sys.stdout):
+def tidy(root, template, mcp_config, extra, timeout, out=sys.stdout):
+    """Run the editor: an agent that plays no game, but folds the playbook
+    back within its budget and writes field notes for strategies that have
+    none (see learn.upkeep).  Returns True if there was nothing to do or
+    the jobs are all done afterwards."""
+    jobs = learn.upkeep(root)
+    if not jobs:
+        out.write("Nothing to tidy: the playbook is within its budget and every strategy "
+                  "that has been played has field notes.\n")
+        return True
+    before = learn.load(root)
+    out.write("Tidying before play:\n" + "".join("  - %s\n" % j for j in jobs))
+    out.flush()
+    prompt = EDITOR_PROMPT % "\n".join("- " + j for j in jobs)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    new, _ = run_cycle(root, 0, agent_command(template, prompt, mcp_config, extra), timeout, out,
+                       log_name="editor-%s.log" % stamp)
+    for meta in new:
+        out.write("  the editor started a game it should not have: %s\n" % meta["run_id"])
+    after = learn.load(root)
+    out.write("  playbook: %d characters in %d lessons, was %d in %d (budget %d)\n" % (
+        learn.playbook_size(after), len(learn.live_lessons(after)),
+        learn.playbook_size(before), len(learn.live_lessons(before)),
+        after["rules"]["playbook_budget"]))
+    left = learn.upkeep(root)
+    for job in left:
+        out.write("  still to do: %s\n" % job)
+    out.flush()
+    return not left
+
+
+def run_cycle(root, number, command, timeout, out=sys.stdout, log_name=None):
     """Start one agent and wait for it.  Returns the finished runs it left
     (newest first) and whether the agent itself exited cleanly."""
     before = {m["run_id"] for m in runs.list_runs(root)}
     log_dir = os.path.join(root, "coach-logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "cycle-%03d.log" % number)
+    log_path = os.path.join(log_dir, log_name or "cycle-%03d.log" % number)
     started = time.time()
     ok = True
     with open(log_path, "w", encoding="utf-8") as log:
@@ -132,9 +204,17 @@ def main(argv=None):
                        ("patience", "failed ideas in a row before stepping back"),
                        ("window", "latest games the difficulty ladder looks at"),
                        ("wins", "wins among those games that move the campaign up a difficulty"),
-                       ("top", "the difficulty at which the campaign is complete")):
-        ap.add_argument("--" + rule, type=float if rule == "margin" else int, default=None,
+                       ("top", "the difficulty at which the campaign is complete"),
+                       ("playbook_budget", "characters of lessons the playbook may hold before "
+                                           "the editor is sent to merge them")):
+        ap.add_argument("--" + rule.replace("_", "-"), type=float if rule == "margin" else int,
+                        default=None,
                         help="for a NEW campaign: %s (default %s)" % (text, learn.DEFAULT_RULES[rule]))
+    ap.add_argument("--tidy", action="store_true",
+                    help="only run the editor (merge the playbook back within its budget, write "
+                         "missing field notes), play no game, and exit")
+    ap.add_argument("--no-tidy", action="store_true",
+                    help="do not run the editor before play when the campaign needs tidying")
     ap.add_argument("--status", action="store_true",
                     help="print the campaign (playbook and strategies) and exit")
     ap.add_argument("--print-command", action="store_true",
@@ -173,13 +253,20 @@ def main(argv=None):
         extra += ["--model", args.model]
     if args.max_budget_usd is not None:
         extra += ["--max-budget-usd", str(args.max_budget_usd)]
-    command = agent_command(args.agent_cmd, PROMPT, write_mcp_config(root, args.watch), extra)
+    mcp_config = write_mcp_config(root, args.watch)
+    command = agent_command(args.agent_cmd, PROMPT, mcp_config, extra)
     if args.print_command:
         out.write(" ".join(shlex.quote(w) for w in command) + "\n")
         return 0
 
     out.write("%s campaign in %s, difficulty %d\n" % (
         "New" if new_campaign else "Continuing the", root, campaign["difficulty"]))
+    if args.tidy:
+        return 0 if tidy(root, args.agent_cmd, mcp_config, extra, args.timeout, out) else 1
+    if not args.no_tidy and learn.upkeep(root):
+        # Once per invocation: if the editor could not finish, play goes on
+        # with what there is, and the next invocation tries again.
+        tidy(root, args.agent_cmd, mcp_config, extra, args.timeout, out)
     failures = 0
     for number in range(1, args.cycles + 1):
         campaign = learn.load(root)

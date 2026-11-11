@@ -38,6 +38,22 @@ Each cycle of the loop is: read the briefing, play one game under the
 strategy it names, write the post-mortem, then record lessons and, if
 there is a specific idea to test, propose a new strategy.
 
+Keeping it short
+----------------
+Every agent starts from the briefing alone, so the briefing must not grow
+with the number of games.  Three things are distilled as play goes on:
+
+* A game has a one-line takeaway (see `runs.takeaway`).
+* A strategy has a digest: numbers worked out from its recordings
+  (`digest`), and field notes that each agent rewrites whole after its game
+  (`note_strategy`), so they stay one short text.  `strategy_report` puts
+  both in one place with a line per game.
+* The playbook has a budget (`playbook_budget`).  A lesson is short and has
+  a topic; `merge_lessons` folds overlapping ones into one that carries
+  their evidence.  Over its budget, the briefing lists once-seen lessons by
+  topic instead of carrying their text (`_playbook_lines`), and `upkeep`
+  names the tidying to be done, which the coach hands to an editor.
+
 Nothing here touches the game engine.
 """
 
@@ -61,7 +77,16 @@ DEFAULT_RULES = {
     "window": 5,      # the ladder looks at this many of the latest games...
     "wins": 3,        # ...and moves up a difficulty when this many were won
     "top": 5,         # the difficulty at which the campaign is complete
+    "playbook_budget": 12000,   # characters of lessons the briefing carries; see playbook_size
 }
+
+LESSON_MAX = 300     # characters in one lesson
+TOPIC_MAX = 30       # characters in a lesson's topic
+NOTES_MAX = 1200     # characters in a strategy's field notes
+NOTES_KEPT = 10      # earlier versions of a strategy's field notes (or recipe) kept on record
+RECIPE_MAX = 2500    # characters in the recipe of a winning line
+LINE = "line"        # the `kind` of a strategy made from a win; see _new_lines
+LIVE = ("confirmed", "tentative")   # lessons in force (not retracted, not merged away)
 
 GOAL = ("Win Ularn: find the potion of cure dianthroritis and bring it home "
         "before the time runs out.")
@@ -130,6 +155,8 @@ def _check_rules(rules):
         raise LearnError("rules: wins is at least 1 and at most window")
     if not 0 <= out["top"] <= 100:
         raise LearnError("rules: top is a difficulty, 0 to 100")
+    if out["playbook_budget"] < 1000:
+        raise LearnError("rules: playbook_budget is at least 1000 characters")
     return out
 
 
@@ -299,17 +326,46 @@ def propose(root, title, change, parent=None, character_class=None, retry_reason
     return campaign["strategies"][sid]
 
 
+def repeat_wins(all_runs):
+    """The run ids of wins that do not count: wins on a seed that an
+    earlier game had already won at that difficulty.  Games are
+    deterministic, so a seed that has been won can be won again by playing
+    the same keys, which shows nothing about the strategy."""
+    won, repeats = set(), set()
+    for meta in reversed(all_runs):                       # oldest first
+        if not (meta.get("outcome") or {}).get("won"):
+            continue
+        key = (meta.get("difficulty"), meta.get("seed"))
+        if key in won:
+            repeats.add(meta.get("run_id"))
+        won.add(key)
+    return repeats
+
+
+def _counted_progress(meta, repeats):
+    """A game's progress for judging strategies.  A repeat win is scored as
+    a game that held the cure: what it adds to the first win is not news."""
+    outcome = meta.get("outcome") or {}
+    if meta.get("run_id") in repeats:
+        p = progress(dict(outcome, won=False, has_cure=True))
+        return dict(p, milestone="won again on a seed already won (not counted as a win)")
+    return meta.get("progress") or progress(outcome)
+
+
 def stats(campaign, all_runs):
     """Results per strategy at the campaign's difficulty, from the runs.
 
     "trial" and "holdout" map a seed to the progress score of the first
     finished game the strategy played on it; those are what it is judged
-    on.  "runs", "mean" and "best" cover every finished game.
+    on.  "line" does the same for the seeds of a winning line, and
+    "line_wins" lists those of them it won.  "runs", "mean" and "best" cover
+    every finished game.  A win on a seed already won is not a win here.
     """
     trial_seeds = set(campaign["seeds"]["trial"])
     holdout_seeds = set(campaign["seeds"]["holdout"])
+    repeats = repeat_wins(all_runs)
     out = {sid: {"runs": 0, "wins": 0, "scores": [], "best": None, "run_ids": [],
-                 "trial": {}, "holdout": {}}
+                 "trial": {}, "holdout": {}, "line": {}, "line_wins": []}
            for sid in campaign["strategies"]}
     for meta in reversed(all_runs):                       # oldest first
         st = out.get(meta.get("strategy"))
@@ -318,15 +374,21 @@ def stats(campaign, all_runs):
             continue
         if meta.get("difficulty") != campaign["difficulty"]:
             continue
-        p = meta.get("progress") or progress(outcome)
+        p = _counted_progress(meta, repeats)
+        won = bool(outcome.get("won")) and meta.get("run_id") not in repeats
         st["runs"] += 1
-        st["wins"] += 1 if outcome.get("won") else 0
+        st["wins"] += 1 if won else 0
         st["scores"].append(p["score"])
         st["run_ids"].append(meta.get("run_id"))
         if st["best"] is None or p["score"] > st["best"]["score"]:
             st["best"] = p
         seed = meta.get("seed")
-        if seed in trial_seeds:
+        if seed in (campaign["strategies"][meta["strategy"]].get("seeds") or ()):
+            if seed not in st["line"]:
+                st["line"][seed] = p["score"]
+                if won:
+                    st["line_wins"].append(seed)
+        elif seed in trial_seeds:
             st["trial"].setdefault(seed, p["score"])
         elif seed in holdout_seeds:
             st["holdout"].setdefault(seed, p["score"])
@@ -345,7 +407,10 @@ def _mean(values):
 def next_seed(campaign, sid, strategy_stats):
     """The seed the strategy's next game should use, or None for any."""
     st = strategy_stats[sid]
-    which = "holdout" if strategy(campaign, sid)["status"] == "holdout" else "trial"
+    s = strategy(campaign, sid)
+    if s["status"] == LINE:
+        return next((seed for seed in s["seeds"] if seed not in st["line"]), None)
+    which = "holdout" if s["status"] == "holdout" else "trial"
     for seed in campaign["seeds"][which]:
         if seed not in st[which]:
             return seed
@@ -374,14 +439,95 @@ def _prove(campaign, s, st, why):
     _log(campaign, "%s %s proven: %s." % (s["id"], s["title"], why))
 
 
+def _new_lines(campaign, all_runs):
+    """Turn a win into a strategy of its own: a winning line.
+
+    A game won under an ordinary strategy shows that strategy can win, but
+    not how: that is in the one game.  So the win gets a strategy that
+    follows it, a child of the strategy it was played under, holding the
+    win as its model and (once an agent has written it) a recipe.  It is
+    played next, on seeds nobody has played, and judged on whether it wins
+    there (`_judge_lines`), not on average progress.
+
+    A second win under the same strategy while its line is still being
+    tried is added to that line as another model.  A win under a line is
+    the line working, and makes nothing new.  Wins on a seed already won
+    are ignored throughout.
+    """
+    repeats = repeat_wins(all_runs)
+    known = {run for s in campaign["strategies"].values() for run in s.get("models") or ()}
+    made = False
+    for meta in reversed(all_runs):                       # oldest first
+        outcome = meta.get("outcome") or {}
+        run, sid = meta.get("run_id"), meta.get("strategy")
+        if not outcome.get("won") or run in repeats or run in known:
+            continue
+        if meta.get("difficulty") != campaign["difficulty"] or sid not in campaign["strategies"]:
+            continue
+        parent = campaign["strategies"][sid]
+        if parent.get("kind") == LINE:
+            continue
+        known.add(run)
+        made = True
+        live = [s for s in children(campaign, sid) if s.get("kind") == LINE and s["status"] == LINE]
+        if live:
+            live[-1]["models"].append(run)
+            _log(campaign, "%s won again (%s). It is added to %s as another game to follow."
+                 % (sid, run, live[-1]["id"]))
+            continue
+        used = {m.get("seed") for m in all_runs}
+        used |= {s for group in campaign["seeds"].values() for s in group}
+        used |= {s for c in campaign["cleared"] for group in c["seeds"].values() for s in group}
+        used |= {s for other in campaign["strategies"].values() for s in other.get("seeds") or ()}
+        new = "S%d" % campaign["next_strategy"]
+        campaign["next_strategy"] += 1
+        campaign["strategies"][new] = {
+            "id": new, "parent": sid, "kind": LINE, "status": LINE,
+            "title": ("Winning line: " + parent["title"])[:80],
+            "change": "Follow the recipe distilled from the won game %s, stage by stage, "
+                      "building up to what the winner was at each level before going on." % run,
+            "character_class": (meta.get("character_class") or "").lower() or None,
+            "models": [run], "seeds": _seeds(campaign["rules"]["budget"], used),
+            "recipe": None, "note": None, "created": _now()}
+        _log(campaign, "%s %s won a game (%s). %s is made to follow that win; it is played next, "
+             "on seeds nobody has played, and kept if it wins there."
+             % (sid, parent["title"], run, new))
+    return made
+
+
+def _judge_lines(campaign, st):
+    """A winning line is proven, and becomes the base, as soon as it wins
+    on one of its unseen seeds.  If it has played them all and won none,
+    the win it follows was not something it could repeat: it is abandoned."""
+    judged = False
+    for s in sorted(campaign["strategies"].values(), key=_number):
+        if s["status"] != LINE:
+            continue
+        mine = st[s["id"]]
+        played = "%d game%s on seeds nobody had played" % (
+            len(mine["line"]), "" if len(mine["line"]) == 1 else "s")
+        if mine["line_wins"]:
+            s["status"] = "proven"
+            s["note"] = "won %d of its first %s" % (len(mine["line_wins"]), played)
+            campaign["base"] = s["id"]
+            _log(campaign, "%s %s proven: %s; it is the new base." % (s["id"], s["title"], s["note"]))
+            judged = True
+        elif len(mine["line"]) >= len(s["seeds"]):
+            _abandon(campaign, s, "won none of its %s (average progress %s, best: %s)" % (
+                played, _mean(mine["line"].values()), mine["best"]["milestone"]))
+            judged = True
+    return judged
+
+
 def advance(campaign, all_runs):
     """Judge every strategy whose games are in, and step back from a line
     that has stalled.  Changes `campaign`; returns True if anything changed."""
     rules = campaign["rules"]
     changed = False
     while True:
+        step = _new_lines(campaign, all_runs)
         st = stats(campaign, all_runs)
-        step = False
+        step = _judge_lines(campaign, st) or step
         for s in sorted(campaign["strategies"].values(), key=_number):
             if s["status"] not in ("trial", "holdout"):
                 continue
@@ -433,9 +579,13 @@ def ladder(campaign, all_runs):
             and m.get("difficulty") == campaign["difficulty"]
             and m.get("strategy") in campaign["strategies"]]
     recent = here[:rules["window"]]
+    repeats = repeat_wins(all_runs)       # a seed already won does not count again
+
+    def wins(games):
+        return sum(1 for m in games if m["outcome"].get("won") and m.get("run_id") not in repeats)
+
     return {"difficulty": campaign["difficulty"], "top": rules["top"],
-            "games": len(here), "total_wins": sum(1 for m in here if m["outcome"].get("won")),
-            "recent_wins": sum(1 for m in recent if m["outcome"].get("won")),
+            "games": len(here), "total_wins": wins(here), "recent_wins": wins(recent),
             "wins": rules["wins"], "window": rules["window"]}
 
 
@@ -509,9 +659,13 @@ def choose_next(campaign, strategy_stats):
     """
     rules = campaign["rules"]
     base = campaign["base"]
+    live = sorted(campaign["strategies"].values(), key=_number)
+    for s in live:
+        if s["status"] == LINE:
+            return (s["id"], "it follows the won game %s; this tries its recipe on a seed nobody "
+                             "has played" % s["models"][0], False)
     if len(strategy_stats[base]["trial"]) < rules["budget"]:
         return base, "measuring the base, so later ideas have something to beat", False
-    live = sorted(campaign["strategies"].values(), key=_number)
     for s in live:
         if s["status"] == "holdout":
             return s["id"], "it passed its trial; this checks it on unseen seeds", False
@@ -529,35 +683,436 @@ def choose_next(campaign, strategy_stats):
 CONFIDENCE = ("confirmed", "tentative")
 
 
-def add_lesson(root, text, evidence=(), confidence="tentative"):
-    text = str(text or "").strip()
+def live_lessons(campaign):
+    return [l for l in campaign["lessons"] if l["status"] in LIVE]
+
+
+def playbook_size(campaign):
+    """Characters of lesson text in force: what every briefing has to carry."""
+    return sum(len(l["text"]) for l in live_lessons(campaign))
+
+
+def topics(campaign):
+    """The topics in use, most lessons first."""
+    count = {}
+    for l in live_lessons(campaign):
+        if l.get("topic"):
+            count[l["topic"]] = count.get(l["topic"], 0) + 1
+    return sorted(count, key=lambda t: (-count[t], t))
+
+
+def _lesson_text(text):
+    text = " ".join(str(text or "").split())
     if not text:
         raise LearnError("the lesson is empty")
-    if confidence not in CONFIDENCE:
-        raise LearnError("confidence must be confirmed or tentative")
+    if len(text) > LESSON_MAX:
+        raise LearnError(
+            "a lesson is at most %d characters and this is %d. Say the one thing a later game "
+            "should do, and the number that matters; the story of how you found out belongs in "
+            "the post-mortem." % (LESSON_MAX, len(text)))
+    return text
+
+
+def _topic(campaign, topic, default=None):
+    topic = " ".join(str(topic or "").lower().split()) or default
+    if not topic:
+        used = topics(campaign)
+        raise LearnError(
+            "a lesson needs a topic: a word or two for what it is about (a monster, a place, an "
+            "item, a tool), so that lessons on one subject can be found and merged. %s"
+            % ("Topics in use: %s." % ", ".join(used[:25]) if used
+               else "For example: dragons, volcano, town, traps."))
+    if len(topic) > TOPIC_MAX:
+        raise LearnError("a topic is a word or two, at most %d characters" % TOPIC_MAX)
+    return topic
+
+
+def _check_evidence(root, evidence):
     evidence = [str(e) for e in evidence or ()]
     known = {m["run_id"] for m in runs.list_runs(root)}
     unknown = [e for e in evidence if e not in known]
     if unknown:
         raise LearnError("no such run: " + ", ".join(unknown))
+    return evidence
+
+
+def add_lesson(root, text, evidence=(), confidence="tentative", topic=None):
+    text = _lesson_text(text)
+    if confidence not in CONFIDENCE:
+        raise LearnError("confidence must be confirmed or tentative")
+    evidence = _check_evidence(root, evidence)
     if confidence == "confirmed" and not evidence:
         raise LearnError("a confirmed lesson must cite the runs that showed it")
     campaign = load(root)
     for lesson in campaign["lessons"]:
-        if lesson["status"] != "retracted" and lesson["text"].lower() == text.lower():
+        if lesson["status"] in LIVE and lesson["text"].lower() == text.lower():
             # The same lesson again: add the new evidence to it.
             lesson["evidence"] = sorted(set(lesson["evidence"]) | set(evidence))
             if confidence == "confirmed":
                 lesson["status"] = "confirmed"
+            if topic and not lesson.get("topic"):
+                lesson["topic"] = _topic(campaign, topic)
             save(root, campaign)
             return lesson
-    lesson = {"id": "L%d" % campaign["next_lesson"], "text": text, "evidence": evidence,
+    lesson = {"id": "L%d" % campaign["next_lesson"], "text": text,
+              "topic": _topic(campaign, topic), "evidence": evidence,
               "status": confidence, "note": None, "added": _now(),
               "difficulty": campaign["difficulty"]}
     campaign["next_lesson"] += 1
     campaign["lessons"].append(lesson)
     save(root, campaign)
     return lesson
+
+
+def merge_lessons(root, lesson_ids, text, topic=None):
+    """Fold lessons into one: the new lesson takes their place and pools
+    their evidence.  With a single id it is a rewrite, to shorten a lesson
+    or give it a topic.  The old ones stay on record as merged.  Returns
+    (the new lesson, characters the playbook shrank by)."""
+    ids = [str(i).strip() for i in lesson_ids or () if str(i).strip()]
+    if not ids:
+        raise LearnError("name the lessons to merge, by id (L3, L8, ...)")
+    if len(set(ids)) != len(ids):
+        raise LearnError("a lesson is named twice")
+    text = _lesson_text(text)
+    campaign = load(root)
+    by_id = {l["id"]: l for l in campaign["lessons"]}
+    old = []
+    for i in ids:
+        lesson = by_id.get(i)
+        if lesson is None:
+            raise LearnError("no lesson called %r" % i)
+        if lesson["status"] not in LIVE:
+            raise LearnError("%s is %s%s" % (i, lesson["status"],
+                                             ": " + lesson["note"] if lesson.get("note") else ""))
+        old.append(lesson)
+    used = [l["topic"] for l in old if l.get("topic")]
+    topic = _topic(campaign, topic, max(used, key=used.count) if used else None)
+    evidence = sorted({e for l in old for e in l["evidence"]})
+    # More than one run behind it, or a part that was already confirmed.
+    confirmed = len(evidence) > 1 or any(l["status"] == "confirmed" for l in old)
+    new = {"id": "L%d" % campaign["next_lesson"], "text": text, "topic": topic,
+           "evidence": evidence, "status": "confirmed" if confirmed else "tentative",
+           "note": None, "added": _now(), "merged_from": ids,
+           "difficulty": max(l.get("difficulty", campaign["difficulty"]) for l in old)}
+    campaign["next_lesson"] += 1
+    saved = sum(len(l["text"]) for l in old) - len(text)
+    for l in old:
+        l["status"] = "merged"
+        l["note"] = "merged into " + new["id"]
+    campaign["lessons"].append(new)
+    save(root, campaign)
+    return new, saved
+
+
+def lessons_text(root, about=None):
+    """The playbook in full, for looking a subject up or for tidying it:
+    one lesson per line with its id, topic, standing and evidence.  `about`
+    keeps the lessons whose topic or text mentions it."""
+    campaign = load(root)
+    word = " ".join(str(about or "").lower().split())
+    found = [l for l in live_lessons(campaign)
+             if not word or word in (l.get("topic") or "") or word in l["text"].lower()]
+    budget = campaign["rules"]["playbook_budget"]
+    lines = ["%d lesson%s%s. The whole playbook is %d characters; its budget is %d."
+             % (len(found), "" if len(found) == 1 else "s", " about %r" % word if word else "",
+                playbook_size(campaign), budget), ""]
+    found.sort(key=lambda l: (l.get("topic") or "~", _lesson_number(l)))
+    for l in found:
+        lines.append("- %s [%s] (%s, %d run%s, %d chars): %s" % (
+            l["id"], l.get("topic") or "no topic", l["status"], len(l["evidence"]),
+            "" if len(l["evidence"]) == 1 else "s", len(l["text"]), l["text"]))
+    if not found:
+        lines.append("_Nothing%s._" % (" on that; topics in use: " + ", ".join(topics(campaign))
+                                       if word else " yet"))
+    return "\n".join(lines)
+
+
+def _lesson_number(lesson):
+    return int(lesson["id"][1:])
+
+
+# ====================================================================== digests
+
+def digest(campaign, sid, all_runs):
+    """What the recordings say about a strategy: the games that count for
+    it (finished, at the campaign's difficulty), how far they got and what
+    ended them.  Worked out from the runs each time, never stored."""
+    strategy(campaign, sid)
+    games = [m for m in all_runs
+             if m.get("strategy") == sid and m.get("difficulty") == campaign["difficulty"]
+             and (m.get("outcome") or {}).get("result") in COUNTED]
+    outs = [m["outcome"] for m in games]
+    lost = [o for o in outs if not o.get("won")]
+
+    def tally(values):
+        count = {}
+        for v in values:
+            count[v] = count.get(v, 0) + 1
+        return sorted(count.items(), key=lambda kv: (-kv[1], str(kv[0])))
+
+    turns = sorted(o.get("turns") or 0 for o in outs)
+    scores = [(m.get("progress") or progress(m["outcome"])) for m in games]
+    return {
+        "games": len(games), "wins": sum(1 for o in outs if o.get("won")),
+        "cure": sum(1 for o in outs if o.get("has_cure") or o.get("won")),
+        "mean": _mean(p["score"] for p in scores),
+        "best": max(scores, key=lambda p: p["score"])["milestone"] if scores else None,
+        "ended_by": tally(o.get("killer") or o.get("reason") or o.get("result") for o in lost),
+        "ended_on": tally("town" if o.get("dungeon_level") == "H" else str(o.get("dungeon_level"))
+                          for o in lost),
+        "median_turns": turns[len(turns) // 2] if turns else None,
+        "runs": games,                     # newest first
+    }
+
+
+def _counts(pairs, limit=6):
+    text = ", ".join("%s%s" % (name, " ×%d" % n if n > 1 else "") for name, n in pairs[:limit])
+    return text + (", and %d more" % (len(pairs) - limit) if len(pairs) > limit else "")
+
+
+def _digest_lines(d):
+    if not d["games"]:
+        return ["No finished game yet."]
+    lines = ["%d game%s: %d won, %d held the cure. Average progress %s; best: %s."
+             % (d["games"], "" if d["games"] == 1 else "s", d["wins"], d["cure"], d["mean"],
+                d["best"])]
+    if d["ended_by"]:
+        lines.append("Ended by: %s." % _counts(d["ended_by"]))
+        lines.append("Ended on level: %s. A game lasted about %s turns."
+                     % (_counts(d["ended_on"]), d["median_turns"]))
+    return lines
+
+
+def note_strategy(root, sid, text, run_id=None):
+    """Replace a strategy's field notes: the one short account of how it
+    plays, how it dies and what to do differently, which every agent that
+    plays it brings up to date.  Earlier versions stay on record."""
+    text = "\n".join(line.rstrip() for line in str(text or "").strip().splitlines())
+    if not text:
+        raise LearnError("the notes are empty")
+    if len(text) > NOTES_MAX:
+        raise LearnError(
+            "field notes are at most %d characters and these are %d. They are rewritten whole "
+            "each time, not added to: keep what still holds, drop what one game showed and no "
+            "other did, and leave single events to the post-mortems." % (NOTES_MAX, len(text)))
+    campaign = load(root)
+    s = strategy(campaign, sid)
+    if s.get("kind") == LINE:
+        raise LearnError("%s is a winning line: its account is its recipe. Rewrite that with "
+                         "write_recipe." % sid)
+    all_runs = runs.list_runs(root)
+    if run_id is not None and run_id not in {m["run_id"] for m in all_runs}:
+        raise LearnError("no such run: %s" % run_id)
+    if s.get("notes"):
+        s["notes_history"] = ([s["notes"]] + (s.get("notes_history") or []))[:NOTES_KEPT]
+    s["notes"] = {"text": text, "when": _now(), "run": run_id,
+                  "games": digest(campaign, sid, all_runs)["games"]}
+    save(root, campaign)
+    return s
+
+
+RECIPE_GUIDE = (
+    "Write it as stages in the order they are played (for example: town and level 1; down "
+    "to the level where the build-up is done; the volcano; taking the cure; the way home). "
+    "For each stage say what to do, what to buy or learn, and what you must have before "
+    "going on, in numbers: character level, HP, AC, WC, and the scrolls and potions in the "
+    "pack. Then list the killers met and the answer to each. Take the numbers from the run "
+    "sheet. Leave out anything about where things lay on the map: the next game is in "
+    "another dungeon.")
+
+
+def recipe_prompt(root, campaign, line, meta):
+    """What to tell the agent that has just written up a game belonging to
+    a winning line: write the recipe (the game was the win), or revise it
+    (the game followed the line), with the facts to do it from."""
+    sid, run = line["id"], meta.get("run_id")
+    recipe = line.get("recipe")
+    try:
+        mine = runs.run_sheet(runs.read_events(runs.run_dir(root, run)))
+    except runs.RunError:
+        mine = None
+    lines = [""]
+    if run in line["models"]:
+        lines += ["This game was WON. %s %s has been made to follow it: it is played next, on "
+                  "seeds nobody has played, and kept if it wins there. %s its recipe now with "
+                  "write_recipe (strategy \"%s\", at most %d characters). It is what the next "
+                  "agent plays from." % (sid, line["title"], "Revise" if recipe else "Write",
+                                         sid, RECIPE_MAX), "", RECIPE_GUIDE]
+        if mine:
+            lines += ["", "The run sheet of your game:", ""] + runs.sheet_lines(mine)
+    else:
+        won = (meta.get("outcome") or {}).get("won")
+        lines += ["This game followed the winning line %s. Now rewrite its recipe with "
+                  "write_recipe (strategy \"%s\", at most %d characters, the whole of it): keep "
+                  "the stages that held, and change the stage where this game %s."
+                  % (sid, sid, RECIPE_MAX,
+                     "did better than the recipe asked" if won else "went wrong")]
+        model = model_sheet(root, line)
+        if model and mine:
+            lines += ["", "Your game beside the game that won:", ""]
+            lines += runs.compare_sheets(model, mine)
+        if not recipe:
+            lines += ["", "There is no recipe yet: yours will be the first.", "", RECIPE_GUIDE]
+    if recipe:
+        lines += ["", "The recipe as it stands:", ""] + recipe["text"].splitlines()
+    return "\n".join(lines)
+
+
+def write_recipe(root, sid, text, run_id=None):
+    """Write, or rewrite whole, the recipe of a winning line: the staged
+    plan drawn from the game that won, which each later game under the line
+    revises with what it found.  Earlier versions stay on record."""
+    text = "\n".join(line.rstrip() for line in str(text or "").strip().splitlines())
+    if not text:
+        raise LearnError("the recipe is empty")
+    if len(text) > RECIPE_MAX:
+        raise LearnError(
+            "a recipe is at most %d characters and this is %d. It is rewritten whole each "
+            "time: stages in order, each with what to have before going on, and the killers "
+            "with the answer to each. Leave the story to the post-mortem."
+            % (RECIPE_MAX, len(text)))
+    campaign = load(root)
+    s = strategy(campaign, sid)
+    if s.get("kind") != LINE:
+        raise LearnError("%s is not a winning line, so it has no recipe; its account is its "
+                         "field notes (note_strategy). A winning line is made by the campaign "
+                         "when a game is won." % sid)
+    all_runs = runs.list_runs(root)
+    if run_id is not None and run_id not in {m["run_id"] for m in all_runs}:
+        raise LearnError("no such run: %s" % run_id)
+    if s.get("recipe"):
+        s["recipe_history"] = ([s["recipe"]] + (s.get("recipe_history") or []))[:NOTES_KEPT]
+    s["recipe"] = {"text": text, "when": _now(), "run": run_id,
+                   "games": digest(campaign, sid, all_runs)["games"]}
+    save(root, campaign)
+    return s
+
+
+def line_of(campaign, meta):
+    """The winning line a game belongs to: the one made from it if it was
+    the win, or the one it was played under.  None for any other game."""
+    for s in campaign["strategies"].values():
+        if meta.get("run_id") in (s.get("models") or ()):
+            return s
+    s = campaign["strategies"].get(meta.get("strategy"))
+    return s if s and s.get("kind") == LINE else None
+
+
+def model_sheet(root, s):
+    """The run sheet of the game a winning line follows (its first model)."""
+    try:
+        return runs.run_sheet(runs.read_events(runs.run_dir(root, s["models"][0])))
+    except runs.RunError:
+        return None
+
+
+def _recipe_lines(root, campaign, s, all_runs):
+    """A winning line for the agent about to play it: the recipe, and what
+    the winner was on reaching each level, to measure oneself against."""
+    recipe = s.get("recipe")
+    lines = []
+    if recipe:
+        played = digest(campaign, s["id"], all_runs)["games"]
+        lines += ["The recipe (as rewritten after %d of this line's %d games):"
+                  % (min(recipe.get("games") or 0, played), played), ""]
+        lines += recipe["text"].splitlines()
+    else:
+        lines += ["_No recipe has been written yet. Work from the run sheet below and from "
+                  "`get_run` of the won game, and write the recipe after your game._"]
+    sheet = model_sheet(root, s)
+    if sheet:
+        lines += ["", "The game that won, %s. Measure yourself against it on reaching each "
+                  "level: where you are behind, build up before going deeper." % s["models"][0], ""]
+        lines += runs.sheet_lines(sheet)
+    if len(s["models"]) > 1:
+        lines += ["", "Also won under the same strategy (`get_run` shows each): "
+                  + ", ".join(s["models"][1:]) + "."]
+    return lines
+
+
+def _notes_lines(campaign, sid, all_runs, own=True):
+    """A strategy's field notes, with how many of its games they cover."""
+    s = strategy(campaign, sid)
+    notes = s.get("notes")
+    if not notes:
+        return ["_No field notes yet._"] if own else []
+    played = digest(campaign, sid, all_runs)["games"]
+    behind = played - (notes.get("games") or 0)
+    head = "Field notes" if own else "Field notes of %s %s, which this builds on" % (sid, s["title"])
+    head += " (written after %d of its %d games%s):" % (
+        min(notes.get("games") or 0, played), played,
+        "; %d newer game%s not in them yet" % (behind, "" if behind == 1 else "s") if behind > 0
+        else "")
+    return [head, ""] + notes["text"].splitlines()
+
+
+def strategy_report(root, sid):
+    """Everything about one strategy in one place: what it is, its numbers,
+    its field notes and a line for each of its games."""
+    campaign = load(root)
+    s = strategy(campaign, sid)
+    all_runs = runs.list_runs(root)
+    d = digest(campaign, sid, all_runs)
+    tags = [STATUS_WORDS[s["status"]]] + (["the base"] if sid == campaign["base"] else [])
+    chain = lineage(campaign, sid)
+    lines = ["# %s %s [%s]" % (sid, s["title"], ", ".join(tags)), ""]
+    if len(chain) > 1:
+        lines += ["Builds on: " + " → ".join("%s %s" % (p["id"], p["title"]) for p in chain), "",
+                  "What it does differently from the baseline:", ""]
+        lines += ["- " + c for c in changes(campaign, sid)]
+    else:
+        lines.append(s["change"])
+    cls = character_class(campaign, sid)
+    if cls:
+        lines += ["", "Character class: %s." % cls]
+    if s.get("note"):
+        lines += ["", "Verdict: %s." % s["note"]]
+    lines += ["", "## Numbers", "", "From the recordings, at difficulty %d." % campaign["difficulty"],
+              ""] + _digest_lines(d)
+    if s.get("kind") == LINE:
+        lines += ["", "## Recipe", ""] + _recipe_lines(root, campaign, s, all_runs)
+    else:
+        lines += ["", "## Field notes", ""] + _notes_lines(campaign, sid, all_runs)
+    for p in reversed(chain[:-1]):
+        inherited = _notes_lines(campaign, p["id"], all_runs, own=False)
+        if inherited:
+            lines += [""] + inherited
+    if d["runs"]:
+        lines += ["", "## Its games, newest first", ""]
+        for m in d["runs"]:
+            lines.append("- %s: %s; got to: %s. %s" % (
+                m["run_id"], runs.headline(m),
+                (m.get("progress") or progress(m["outcome"]))["milestone"], runs.takeaway(m)))
+        lines += ["", "`get_run` gives any of these in full."]
+    return "\n".join(lines)
+
+
+def upkeep(root):
+    """What needs tidying before more games are played, as a list of jobs
+    for an editor: a playbook over its budget or with lessons that have no
+    topic, and strategies that have been played but have no field notes."""
+    campaign = load(root)
+    all_runs = runs.list_runs(root)
+    jobs = []
+    size, budget = playbook_size(campaign), campaign["rules"]["playbook_budget"]
+    untagged = [l for l in live_lessons(campaign) if not l.get("topic")]
+    if size > budget:
+        jobs.append("The playbook is %d characters in %d lessons, and its budget is %d: merge "
+                    "and shorten lessons until it fits." % (size, len(live_lessons(campaign)), budget))
+    elif untagged:
+        jobs.append("%d lessons have no topic: give each one (merge_lessons with its own id)."
+                    % len(untagged))
+    for s in sorted(campaign["strategies"].values(), key=_number):
+        played = digest(campaign, s["id"], all_runs)["games"]
+        if s.get("kind") == LINE:
+            if not s.get("recipe") and s["status"] != "abandoned":
+                jobs.append("%s %s follows the won game %s and has no recipe: write it "
+                            "(write_recipe) from that game." % (s["id"], s["title"], s["models"][0]))
+        elif played and not s.get("notes"):
+            jobs.append("%s %s has %d game%s and no field notes: write them."
+                        % (s["id"], s["title"], played, "" if played == 1 else "s"))
+    return jobs
 
 
 def retract_lesson(root, lesson_id, reason):
@@ -580,7 +1135,10 @@ def _stat_text(campaign, s, st):
     rules = campaign["rules"]
     if not st["runs"]:
         return "not played yet"
-    if s["status"] == "holdout":
+    if s["status"] == LINE:
+        text = "%d of %d games on unseen seeds, %d won, average progress %s" % (
+            len(st["line"]), len(s["seeds"]), len(st["line_wins"]), _mean(st["line"].values()))
+    elif s["status"] == "holdout":
         text = "trial average %s; %d of %d games on unseen seeds, average %s" % (
             st["trial_mean"], len(st["holdout"]), rules["holdout"], st["holdout_mean"])
     elif st["trial"]:
@@ -595,7 +1153,8 @@ def _stat_text(campaign, s, st):
 
 
 STATUS_WORDS = {"trial": "on trial", "holdout": "passed its trial, being checked",
-                "proven": "proven", "stalled": "stalled", "abandoned": "abandoned"}
+                "proven": "proven", "stalled": "stalled", "abandoned": "abandoned",
+                LINE: "following a win"}
 
 
 def _tree_lines(campaign, strategy_stats, mark):
@@ -627,9 +1186,56 @@ def _lesson_lines(campaign, status):
         d = lesson.get("difficulty", campaign["difficulty"])
         return "" if d == campaign["difficulty"] else " [learned at difficulty %d]" % d
 
-    return ["- %s: %s%s%s" % (l["id"], l["text"], learned_at(l),
-                             " (runs: %s)" % ", ".join(l["evidence"]) if l["evidence"] else "")
+    return ["- %s%s: %s%s%s" % (l["id"], " [%s]" % l["topic"] if l.get("topic") else "",
+                               l["text"], learned_at(l),
+                               " (runs: %s)" % ", ".join(l["evidence"]) if l["evidence"] else "")
             for l in campaign["lessons"] if l["status"] == status]
+
+
+def _playbook_lines(campaign):
+    """The playbook as the briefing carries it.  Within its budget, every
+    lesson in full, by topic.  Over it, the lessons seen once that have a
+    topic are only listed under it, to be looked up when the subject comes
+    up; confirmed lessons, and any not yet given a topic, stay in full."""
+    live = live_lessons(campaign)
+    if not live:
+        return ["_Empty: this is one of the first games._", ""]
+    size, budget = playbook_size(campaign), campaign["rules"]["playbook_budget"]
+    over = size > budget
+
+    def line(l):
+        d = l.get("difficulty", campaign["difficulty"])
+        runs_ = len(l["evidence"])
+        return "- %s%s: %s%s%s" % (
+            l["id"], " [%s]" % l["topic"] if l.get("topic") else "", l["text"],
+            "" if d == campaign["difficulty"] else " [learned at difficulty %d]" % d,
+            " (%d runs)" % runs_ if runs_ > 1 else "")
+
+    def ordered(lessons):
+        return sorted(lessons, key=lambda l: (l.get("topic") or "~", _lesson_number(l)))
+
+    confirmed = ordered(l for l in live if l["status"] == "confirmed")
+    tentative = ordered(l for l in live if l["status"] == "tentative")
+    listed = [l for l in tentative if over and l.get("topic")]
+    shown = [l for l in tentative if l not in listed]
+    lines = []
+    if over:
+        lines += ["The playbook has outgrown its budget (%d characters in %d lessons; the budget "
+                  "is %d). Do not add to the pile: when what you learned overlaps a lesson "
+                  "here, fold the two into one with `merge_lessons`." % (size, len(live), budget),
+                  ""]
+    if confirmed:
+        lines += ["Confirmed, follow these:", ""] + [line(l) for l in confirmed] + [""]
+    if shown:
+        lines += ["Tentative, seen once:", ""] + [line(l) for l in shown] + [""]
+    if listed:
+        by_topic = {}
+        for l in listed:
+            by_topic.setdefault(l["topic"], []).append(l["id"])
+        lines += ["Tentative, by topic. Read them when the subject comes up: "
+                  "`get_lessons` with `about` set to the topic.", ""]
+        lines += ["- %s: %s" % (t, ", ".join(ids)) for t, ids in sorted(by_topic.items())] + [""]
+    return lines
 
 
 def _failed_lines(campaign):
@@ -682,6 +1288,15 @@ def render(root, campaign=None):
     if retracted:
         lines += ["", "### Retracted", ""]
         lines += ["- %s: ~~%s~~ %s" % (l["id"], l["text"], l.get("note") or "") for l in retracted]
+    merged = [l for l in campaign["lessons"] if l.get("merged_from")]
+    if merged:
+        lines += ["", "### Merged", "",
+                  "Lessons folded into one, which carries their evidence. The originals are in "
+                  "`campaign.json`.", ""]
+        lines += ["- %s ← %s" % (l["id"], ", ".join(l["merged_from"])) for l in merged]
+    lines += ["", "The playbook is %d characters in %d lessons; its budget is %d."
+              % (playbook_size(campaign), len(live_lessons(campaign)),
+                 campaign["rules"]["playbook_budget"])]
     lines += ["", "## Strategies", "",
               "Each strategy is its parent plus one change. Progress is scored as "
               "1 per dungeon level, 2 per volcano level, 10 for the cure, 30 for a win. "
@@ -691,6 +1306,19 @@ def render(root, campaign=None):
     failed = _failed_lines(campaign)
     if failed:
         lines += ["", "## Tried and failed", ""] + failed
+    played = [s for s in sorted(campaign["strategies"].values(), key=_number)
+              if st[s["id"]]["runs"] or s.get("kind") == LINE]
+    if played:
+        lines += ["", "## How each strategy has gone", "",
+                  "The numbers come from the recordings. The field notes are the agents' own "
+                  "account, rewritten after each game."]
+        for s in played:
+            lines += ["", "### %s %s" % (s["id"], s["title"]), ""]
+            lines += _digest_lines(digest(campaign, s["id"], all_runs))
+            if s.get("kind") == LINE:
+                lines += [""] + _recipe_lines(root, campaign, s, all_runs)
+            else:
+                lines += [""] + _notes_lines(campaign, s["id"], all_runs)
     if campaign["log"]:
         lines += ["", "## Decisions", ""]
         lines += ["- %s: %s" % (e["when"][:16].replace("T", " "), e["text"])
@@ -711,9 +1339,19 @@ CYCLE_STEPS = """\
    Keep playing until the game is over. Do not quit a game that can go on.
 3. When it is over, call `summarize_run`. Be exact about what went wrong:
    name the monster, the level, the HP and the decision you would change.
-4. Call `add_lesson` for anything this game showed. Cite the run. Use
-   `confirmed` only when more than one run agrees; otherwise `tentative`.
-   If a lesson in the playbook turned out wrong, call `retract_lesson`.
+   Give a `takeaway`: the one sentence a later reader needs from this game.
+   Then bring the strategy's field notes up to date with `note_strategy`.
+   They are what the next agent reads in place of every game: rewrite them
+   whole, keeping what still holds and adding what this game showed.
+   If you WON, or the strategy is a winning line, `summarize_run` asks for
+   its recipe instead (`write_recipe`): the staged plan the next agent
+   plays from. That is the most useful thing a win leaves behind.
+4. Call `add_lesson` for anything this game showed that the playbook does
+   not already say. Cite the run and give a `topic`. A lesson is one short
+   instruction, not the story of the game. Use `confirmed` only when more
+   than one run agrees; otherwise `tentative`. If it overlaps a lesson
+   already there, fold the two together with `merge_lessons`, which pools
+   their evidence. If a lesson turned out wrong, call `retract_lesson`.
    Lessons must hold in any dungeon: the same seeds are played again, so
    never record where things are on a particular map.
    What you found out about a particular item (what it does, whether it
@@ -768,14 +1406,27 @@ def briefing(root):
     else:
         lines += ["", s["change"]]
 
+    # How the strategy has gone so far, so that nobody has to read its
+    # games one by one: the numbers, then what the agents who played it
+    # (and the strategies it builds on) wrote down.
+    lines += ["", "### How it has gone", ""] + _digest_lines(digest(campaign, sid, all_runs))
+    if s.get("kind") == LINE:
+        lines += ["", "### The recipe to follow", "",
+                  "This strategy follows a game that was won. Its recipe is the plan; the "
+                  "table is what the winner was on reaching each level. After your game you "
+                  "rewrite the recipe with `write_recipe`, so say in the post-mortem where "
+                  "the recipe held and where it did not.", ""]
+        lines += _recipe_lines(root, campaign, s, all_runs)
+    else:
+        lines += [""] + _notes_lines(campaign, sid, all_runs)
+    for p in reversed(lineage(campaign, sid)[:-1]):
+        inherited = _notes_lines(campaign, p["id"], all_runs, own=False)
+        if inherited:
+            lines += [""] + inherited
+    lines += ["", "`get_strategy` gives this for any strategy, with a line for each of its games."]
+
     lines += ["", "## Playbook", ""]
-    confirmed, tentative = _lesson_lines(campaign, "confirmed"), _lesson_lines(campaign, "tentative")
-    if confirmed:
-        lines += ["Confirmed, follow these:", ""] + confirmed + [""]
-    if tentative:
-        lines += ["Tentative, seen once:", ""] + tentative + [""]
-    if not confirmed and not tentative:
-        lines += ["_Empty: this is one of the first games._", ""]
+    lines += _playbook_lines(campaign)
     from . import items
     lines += items.briefing_lines(items.load(root))
 
@@ -792,13 +1443,9 @@ def briefing(root):
         lines += ["", "## Latest games", ""]
         for m in done:
             b = runs.brief(m)
-            lines.append("- %s (%s): %s; got to: %s" % (
+            lines.append("- %s (%s): %s; got to: %s. %s" % (
                 b["run_id"], b["strategy"] or "no strategy", b["headline"],
-                (m.get("progress") or progress(m["outcome"]))["milestone"]))
-            notes = m.get("notes") or {}
-            for label, key in (("went wrong", "went_wrong"), ("next time", "next_try")):
-                if notes.get(key):
-                    lines.append("  - %s: %s" % (label, "; ".join(notes[key][:3])))
+                (m.get("progress") or progress(m["outcome"]))["milestone"], runs.takeaway(m)))
         lines.append("")
         lines.append("`get_run` gives any of these in full.")
     lines += ["", CYCLE_STEPS]

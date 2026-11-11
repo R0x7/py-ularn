@@ -146,6 +146,155 @@ def digest(events):
     return d
 
 
+# ====================================================================== run sheet
+
+CURE = "cure dianthroritis"
+
+
+def run_sheet(events):
+    """How a game was built up, stage by stage, from its events alone.
+
+    "stages" has one entry for the first arrival on each level, in the order
+    they were reached: the turn, and what the character was by then (level,
+    HP, AC, WC, gold, spells, what was worn and wielded).  "bought" is the
+    shopping at the DND store, in order.  "spells" are in the order learned.
+    "cure" says when the cure was first in the pack, and "home" lists the
+    levels passed after that.  Turns come from the full states a recording
+    keeps (one per level change, one when the cure is taken, one every so
+    many actions), so a spell's turn is "by", not "at".
+    """
+    sheet = {"stages": [], "bought": [], "spells": [], "cure": None, "home": []}
+    seen, known = set(), set()
+
+    def look(state):
+        level = state.get("level_index")
+        stats = state.get("stats") or {}
+        for spell in state.get("known_spells") or ():
+            if spell not in known:
+                known.add(spell)
+                sheet["spells"].append({"spell": spell, "turn": state.get("turns")})
+        pack = state.get("inventory") or ()
+        if sheet["cure"] is None and any(CURE in line for line in pack):
+            sheet["cure"] = {"turn": state.get("turns"), "level": level_name(level)}
+        if level is None or level in seen:
+            return
+        seen.add(level)
+        kit = [line.split(")", 1)[-1].strip() for line in pack
+               if "(being worn)" in line or "(weapon in hand)" in line]
+        kit = [k.replace(" (being worn)", "").replace(" (weapon in hand)", "") for k in kit]
+        sheet["stages"].append({
+            "level": level_name(level), "turn": state.get("turns"), "cl": stats.get("level"),
+            "hp": stats.get("hp_max"), "ac": stats.get("ac"), "wc": stats.get("wc"),
+            "gold": (stats.get("gold") or 0) + (stats.get("bank") or 0),
+            "spells": len(state.get("known_spells") or ()), "kit": kit})
+
+    level = None
+    for ev in events:
+        kind = ev.get("type")
+        if kind in ("start", "state", "end") and ev.get("state"):
+            look(ev["state"])
+        elif kind == "action":
+            s = ev.get("s") or {}
+            result = ev.get("result")
+            if ev.get("tool") == "buy" and isinstance(result, dict):
+                for b in result.get("bought") or ():
+                    sheet["bought"].append({"name": b.get("name"), "price": b.get("price"),
+                                            "turn": s.get("turn")})
+            if s.get("lvl") is not None and s["lvl"] != level:
+                level = s["lvl"]
+                if sheet["cure"] is not None:
+                    sheet["home"].append({"level": level_name(level), "turn": s.get("turn")})
+    return sheet
+
+
+def sheet_lines(sheet):
+    """A run sheet as Markdown: a table of stages, then the lists."""
+    if not sheet["stages"]:
+        return ["_Nothing recorded._"]
+    lines = ["| First on | Turn | Char level | HP | AC | WC | Gold | Spells | Wearing and wielding |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for s in sheet["stages"]:
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            s["level"], s["turn"], s["cl"], s["hp"], s["ac"], s["wc"], s["gold"], s["spells"],
+            _cell(", ".join(s["kit"]) or "nothing")))
+    lines.append("")
+    if sheet["bought"]:
+        trips = []                        # one entry per visit to the store
+        for b in sheet["bought"]:
+            if not trips or trips[-1]["turn"] != b["turn"]:
+                trips.append({"turn": b["turn"], "names": [], "gold": 0})
+            trips[-1]["names"].append(b["name"])
+            trips[-1]["gold"] += b["price"] or 0
+        said = []
+        for t in trips:
+            names = []
+            for name in dict.fromkeys(t["names"]):
+                n = t["names"].count(name)
+                names.append(name if n == 1 else "%d × %s" % (n, name))
+            said.append("turn %s: %s (%s gold)" % (t["turn"], ", ".join(names), t["gold"]))
+        lines.append("- Bought: " + "; ".join(said))
+    learned = [s for s in sheet["spells"] if s["turn"]]
+    if learned:
+        lines.append("- Spells learned: " + "; ".join(
+            "%s by turn %s" % (s["spell"], s["turn"]) for s in learned))
+    if sheet["cure"]:
+        lines.append("- The cure was in the pack by turn %s, on level %s." % (
+            sheet["cure"]["turn"], sheet["cure"]["level"]))
+        if sheet["home"]:
+            lines.append("- After that: " + " → ".join(
+                "%s (turn %s)" % (h["level"], h["turn"]) for h in sheet["home"]))
+    return lines
+
+
+def _behind(mine, model):
+    """In what a stage falls short of the model's, as text; empty if it keeps pace."""
+    short = []
+    if (mine["cl"] or 0) < (model["cl"] or 0) - 1:
+        short.append("character level %s against %s" % (mine["cl"], model["cl"]))
+    if (mine["hp"] or 0) < 0.8 * (model["hp"] or 0):
+        short.append("%s HP against %s" % (mine["hp"], model["hp"]))
+    if (mine["ac"] or 0) < (model["ac"] or 0) - 2:
+        short.append("AC %s against %s" % (mine["ac"], model["ac"]))
+    if (mine["wc"] or 0) < (model["wc"] or 0) - 4:
+        short.append("WC %s against %s" % (mine["wc"], model["wc"]))
+    return ", ".join(short)
+
+
+def compare_sheets(model, mine):
+    """A game set beside the game it was meant to follow, level by level,
+    and the first place it fell behind.  Returns lines of Markdown."""
+    by_level = {s["level"]: s for s in mine["stages"]}
+
+    def cell(s):
+        return "turn %s: level %s, %s HP, AC %s, WC %s" % (
+            s["turn"], s["cl"], s["hp"], s["ac"], s["wc"]) if s else "never reached"
+
+    stages = [s for s in model["stages"] if s["level"] != "H"]
+    lines = ["| First on | The game that won | This game |", "|---|---|---|"]
+    lines += ["| %s | %s | %s |" % (s["level"], cell(s), cell(by_level.get(s["level"]))) for s in stages]
+    verdict = None
+    for s in stages:
+        got = by_level.get(s["level"])
+        if got is None:
+            verdict = ("It never reached level %s, which the winner entered on turn %s at "
+                       "character level %s with %s HP, AC %s and WC %s."
+                       % (s["level"], s["turn"], s["cl"], s["hp"], s["ac"], s["wc"]))
+            break
+        short = _behind(got, s)
+        if short:
+            verdict = "It first fell behind the winner on arriving at level %s: %s." % (
+                s["level"], short)
+            break
+    if verdict is None:
+        verdict = "It kept pace with the winner on arriving at every level."
+        if model["cure"] and not mine["cure"]:
+            verdict += " It never held the cure, which the winner had by turn %s." % model["cure"]["turn"]
+        elif model["cure"] and mine["cure"]:
+            verdict += " It had the cure by turn %s (the winner by turn %s)." % (
+                mine["cure"]["turn"], model["cure"]["turn"])
+    return lines + ["", verdict]
+
+
 def deepest_text(outcome):
     deep = (outcome or {}).get("deepest") or {}
     parts = []
@@ -202,6 +351,8 @@ def render_summary(meta, events):
 
     lines += ["", "## Post-mortem", ""]
     if notes:
+        if notes.get("takeaway"):
+            lines += ["**In one line:** " + notes["takeaway"], ""]
         lines += [notes.get("synopsis") or "_No synopsis._", "",
                   "### What went wrong", "", _bullets(notes.get("went_wrong")), "",
                   "### What worked", "", _bullets(notes.get("worked")), "",
@@ -233,6 +384,11 @@ def render_summary(meta, events):
         lines.append("- Active effects at the end: " + ", ".join(final["effects"]))
     if final.get("known_spells"):
         lines.append("- Spells known: " + ", ".join(final["known_spells"]))
+    sheet = run_sheet(events)
+    if len(sheet["stages"]) > 1:
+        lines += ["", "### Run sheet", "",
+                  "What the character was on first reaching each level, for setting one game "
+                  "beside another.", ""] + sheet_lines(sheet)
     if final.get("inventory"):
         lines += ["", "### Final inventory", "", _bullets(final["inventory"])]
 
@@ -259,10 +415,11 @@ def write_summary(path):
     return text
 
 
-def set_notes(path, synopsis, went_wrong=(), worked=(), next_try=()):
+def set_notes(path, synopsis, went_wrong=(), worked=(), next_try=(), takeaway=None):
     """Store the agent's post-mortem in meta.json and rebuild summary.md."""
     meta = load_meta(path)
-    meta["notes"] = {"synopsis": str(synopsis).strip(),
+    meta["notes"] = {"takeaway": _clip(takeaway or "") or None,
+                     "synopsis": str(synopsis).strip(),
                      "went_wrong": [str(i).strip() for i in went_wrong or ()],
                      "worked": [str(i).strip() for i in worked or ()],
                      "next_try": [str(i).strip() for i in next_try or ()]}
@@ -270,23 +427,45 @@ def set_notes(path, synopsis, went_wrong=(), worked=(), next_try=()):
     return write_summary(path)
 
 
+TAKEAWAY_MAX = 200   # characters in a game's one-line takeaway
+
+
+def _clip(text, limit=TAKEAWAY_MAX):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def takeaway(meta):
+    """A game in one line: the takeaway its post-mortem gave, or, for games
+    written up before there was one, the first thing that went wrong."""
+    notes = meta.get("notes") or {}
+    if notes.get("takeaway"):
+        return _clip(notes["takeaway"])
+    wrong = notes.get("went_wrong") or []
+    return _clip(wrong[0] if wrong else notes.get("synopsis") or "No post-mortem written.")
+
+
 # ====================================================================== index
 
-def brief(meta):
-    """The few fields of a run worth showing in a list."""
+def brief(meta, full=True):
+    """The few fields of a run worth showing in a list.  Without `full`,
+    the post-mortem is cut down to its one-line takeaway."""
     out = meta.get("outcome") or {}
     notes = meta.get("notes") or {}
-    return {
+    b = {
         "run_id": meta.get("run_id"), "started": meta.get("started"),
         "character_class": meta.get("character_class"), "difficulty": meta.get("difficulty"),
         "seed": meta.get("seed"), "strategy": meta.get("strategy"),
-        "hypotheses": meta.get("hypotheses") or [],
         "result": out.get("result") or "in progress", "headline": headline(meta),
         "deepest": deepest_text(out) if out else None,
         "turns": out.get("turns"), "score": out.get("score"),
         "progress": meta.get("progress"),
-        "synopsis": notes.get("synopsis"), "next_try": notes.get("next_try") or [],
+        "takeaway": takeaway(meta) if notes else None,
     }
+    if full:
+        b.update(hypotheses=meta.get("hypotheses") or [], synopsis=notes.get("synopsis"),
+                 next_try=notes.get("next_try") or [])
+    return b
 
 
 def _cell(value):
