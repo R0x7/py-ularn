@@ -83,6 +83,8 @@ CLASSES = {
     "rogue": "e", "adventurer": "f", "dwarf": "g", "rambo": "h",
 }
 CLASS_NAMES = {v: k for k, v in CLASSES.items()}
+# The game's movement keys, as short compass names.
+KEY_DIRECTIONS = {"k": "n", "j": "s", "l": "e", "h": "w", "u": "ne", "y": "nw", "n": "se", "b": "sw"}
 
 
 def parse_keys(text):
@@ -122,6 +124,19 @@ THOUGHT_SCHEMA = {
     "description": "A sentence or two on what you are doing and why, in plain words. "
                    "People watching the live view see it scroll under the game, so while "
                    "the view is on, give one with most moves, not only at milestones.",
+}
+
+IGNORE_SCHEMA = {
+    "type": "boolean",
+    "description": "Do not stop when monsters appear or come next to you (for walking past "
+                   "sleepers under stealth). The walk still goes round them and still stops "
+                   "when HP drops. Default false.",
+}
+
+STOP_SCHEMA = {
+    "type": "boolean",
+    "description": "Stop sending the remaining keys as soon as HP drops (default true). "
+                   "The result says how many keys were sent and which were not.",
 }
 
 # With the live view on, a game call's result reminds the agent to narrate
@@ -192,6 +207,7 @@ class GameSession:
         header.set_seed(seed)
         self._hook_death()
         self._hook_input()
+        self._hook_attacks()
         self.term = term_virtual.VirtualTerminal()
         self.exit_code = None
         self.error = None
@@ -276,6 +292,62 @@ class GameSession:
             self.outcome = None
 
         scores.died = died
+
+    def _hook_attacks(self):
+        """Remember who attacked the player lately, and whether the screen
+        showed them.  The game names every attacker in its messages, seen or
+        not, but a message scrolls away within a batch of keys; this keeps
+        what it said.  It tells nothing the screen did not: no position,
+        and "monster" for the name while the player is blind.
+
+        An attacker is next to the player, where the screen shows whatever
+        can be seen at all, so "seen" goes by the kind of monster.  It
+        cannot go by what is drawn at that moment: a monster that has just
+        arrived or been born attacks before the screen has caught up, and
+        would be called unseen while standing in plain view."""
+        from . import dungeon, monster, player, skills
+
+        self.attacks = []
+        original = monster.hitplayer
+
+        def hitplayer(x, y):
+            try:
+                vx, vy = dungeon.vxy(x, y)
+                kind = dungeon.mitem[vx][vy].mon
+                shown = not skills.hidden_kind(kind)
+            except Exception:
+                kind, shown = None, True
+            original(x, y)
+            if kind == monster.LEMMING:
+                return      # lemmings never hurt: the game says nothing, nor does this
+            try:
+                name = monster.lastmonst or "monster"
+                self.attacks.append({"name": name, "turn": player.gtime, "seen": shown})
+                del self.attacks[:-20]
+            except Exception:  # never let bookkeeping break the game
+                traceback.print_exc(file=sys.stderr)
+
+        monster.hitplayer = hitplayer
+
+    def recent_attacks(self, turns=10):
+        """Attackers of the last few turns, one entry per monster name and
+        whether it was seen, latest first."""
+        from . import player
+
+        out, done = [], set()
+        for a in reversed(getattr(self, "attacks", [])):
+            if player.gtime - a["turn"] > turns:
+                break
+            key = (a["name"], a["seen"])
+            if key in done:
+                continue
+            done.add(key)
+            entry = {"name": a["name"], "turns_ago": player.gtime - a["turn"], "seen": a["seen"]}
+            if not a["seen"]:
+                entry["note"] = ("not shown on the map: it is invisible or you could not see "
+                                 "it, and it is next to you or was")
+            out.append(entry)
+        return out
 
     def _hook_input(self):
         """Keep track of what kind of input the game is blocked on: a command
@@ -394,7 +466,7 @@ class GameSession:
                 "requested_difficulty": requested_difficulty,
                 "strategy": strategy, "hypotheses": list(hypotheses),
                 "notes": None,
-                "version": header.PYULARN_VERSION}
+                "version": header.PYULARN_VERSION, "skills_version": _skills_version()}
         try:
             self.recorder = recorder.RunRecorder(self.record_dir, meta, state)
         except OSError:
@@ -464,6 +536,23 @@ class GameSession:
         if self.final_outcome() is not None:
             self.close_recording()
 
+    def record_error(self, tool, args, message):
+        """Log a tool call that was refused or failed.  The game did not
+        move, so it is not an action; it is kept to show which calls agents
+        get wrong."""
+        rec = self.recorder
+        if rec is None or rec.closed:
+            return
+        try:
+            turn = None
+            if self.term is not None and not self.error \
+                    and (self.term.finished or self.term.is_waiting()):
+                from . import player
+                turn = player.gtime
+            rec.error(tool, args, message, turn)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
     def close_recording(self):
         rec = self.recorder
         if rec is None or rec.closed:
@@ -496,6 +585,14 @@ class GameSession:
         if self.term.finished:
             return "game over (exit code %s)" % self.exit_code
         if self.term.is_waiting():
+            # Say what the next key will be read as: text left on the screen
+            # by an earlier question can look like a question still waiting.
+            w = self.input_state()
+            if w["kind"] == "command":
+                return "waiting for a command (any question still shown on the screen is over)"
+            if w["kind"] == "prompt":
+                return "waiting for an answer to the question on the screen: " + " ".join(
+                    w.get("answers") or ())
             return "waiting for input"
         return "busy"
 
@@ -525,7 +622,8 @@ class GameSession:
                 "ac": c[player.AC], "wc": c[player.WCLASS],
                 "level": c[player.LEVEL], "experience": c[player.EXPERIENCE],
                 "gold": c[player.GOLD], "bank": c[player.BANKACCOUNT],
-                "str": c[player.STRENGTH], "int": c[player.INTELLIGENCE],
+                "str": c[player.STRENGTH] + c[player.STREXTRA], "str_base": c[player.STRENGTH],
+                "int": c[player.INTELLIGENCE],
                 "wis": c[player.WISDOM], "con": c[player.CONSTITUTION],
                 "dex": c[player.DEXTERITY], "cha": c[player.CHARISMA],
             },
@@ -547,6 +645,7 @@ class GameSession:
             if c[idx]:
                 effects.append(name)
         st["effects"] = effects
+        st["attacked_by"] = self.recent_attacks()
 
         st["known_spells"] = [
             "%s (%s)" % (spell.spelcode[i], spell.spelname[i].strip())
@@ -589,6 +688,12 @@ def _deepest():
     return {"dungeon": max(dungeon_levels, default=0), "volcano": max(volcano_levels, default=0)}
 
 
+def _skills_version():
+    from . import skills
+
+    return skills.VERSION
+
+
 def _visible_monsters():
     from . import skills
 
@@ -597,26 +702,9 @@ def _visible_monsters():
 
 def _capture(fn, *args):
     """Run a show.* function and return what it would have printed."""
-    from . import ularn_win
+    from . import skills
 
-    buf = io.StringIO()
-    saved = ularn_win.Print, ularn_win.Printf, ularn_win.Printc, ularn_win.Standout
-
-    def p(s):
-        buf.write(str(s))
-
-    def pf(fmt, *a):
-        try:
-            buf.write(fmt % a if a else fmt)
-        except (TypeError, ValueError):
-            buf.write(fmt)
-
-    ularn_win.Print, ularn_win.Printf, ularn_win.Printc, ularn_win.Standout = p, pf, p, p
-    try:
-        fn(*args)
-    finally:
-        ularn_win.Print, ularn_win.Printf, ularn_win.Printc, ularn_win.Standout = saved
-    return buf.getvalue()
+    return skills.captured(fn, *args)
 
 
 class ToolError(Exception):
@@ -724,7 +812,10 @@ def tool_new_game(args):
         argv = ["ularn", "-d", str(difficulty)]
     strategy = str(args.get("strategy") or "").strip()[:100] or None
     hypotheses = _string_list(args, "hypotheses")
-    SESSION.start(seed=args.get("seed"), argv=argv, thought=args.get("thought"),
+    seed = args.get("seed")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise ToolError("seed must be a whole number")
+    SESSION.start(seed=seed, argv=argv, thought=args.get("thought"),
                   action="new game" + (" (%s)" % CLASS_NAMES[cls] if cls else ""))
     # Walk through the start-up screens unless the caller wants them.
     if args.get("skip_intro", True):
@@ -762,32 +853,82 @@ def tool_new_game(args):
     return _result(include_state=True, note=note)
 
 
+def _stop_flag(args):
+    value = args.get("stop_when_hurt", True)
+    if not isinstance(value, bool):
+        raise ToolError("stop_when_hurt must be true or false")
+    return value
+
+
+def _send_watching(keys, stop_when_hurt):
+    """Send keys; with `stop_when_hurt`, one at a time, stopping as soon as
+    HP drops or the game ends.  The engine never looks ahead in the key
+    queue, so this plays exactly as sending them all at once would, up to
+    the stop.  Returns a note for the result when keys were left unsent."""
+    if not stop_when_hurt or len(keys) == 1:
+        SESSION.send(keys)
+        return None
+    from . import player
+
+    term = SESSION.term
+    before = player.c[player.HP] if term.is_waiting() else None
+    for i, key in enumerate(keys):
+        SESSION.send([key])
+        if term.finished:
+            rest = keys[i + 1:]
+            return ("The game ended after %d of %d keys; the rest were not sent." % (i + 1, len(keys))
+                    if rest else None)
+        if not term.is_waiting():
+            before = None
+            continue
+        hp = player.c[player.HP]
+        if before is not None and hp < before and i + 1 < len(keys):
+            return ("Stopped after %d of %d keys: HP fell from %d to %d. Not sent: %s "
+                    "(pass stop_when_hurt false to send a whole batch regardless)."
+                    % (i + 1, len(keys), before, hp, _keys_label(keys[i + 1:], 40)))
+        before = hp
+    return None
+
+
 def tool_send_keys(args):
     keys = parse_keys(str(args.get("keys", "")))
     if not keys:
         raise ToolError("keys is empty")
     if SESSION.term is not None and not SESSION.term.finished:
         SESSION.publish_thought(args.get("thought"), "keys " + _keys_label(keys))
-    SESSION.send(keys)
-    SESSION.record_action("send_keys", {"keys": str(args.get("keys", ""))}, args.get("thought"))
-    return _result(include_state=bool(args.get("include_state", False)))
+    stop = _stop_flag(args)
+    note = _send_watching(keys, stop)
+    SESSION.record_action("send_keys", {"keys": str(args.get("keys", "")), "stop_when_hurt": stop},
+                          args.get("thought"))
+    return _result(include_state=bool(args.get("include_state", False)), note=note)
 
 
 def tool_move(args):
-    d = str(args.get("direction", "")).strip().lower()
+    d = str(args.get("direction") or "").strip().lower()
+    game_key = str(args.get("key") or "").strip().lower()
+    if game_key:
+        # The game's own movement key.  "n" is south-east there and north as
+        # a direction, which is why the two are separate arguments.
+        if d:
+            raise ToolError("give direction or key, not both")
+        if game_key not in KEY_DIRECTIONS:
+            raise ToolError("key must be one of: h j k l y u b n")
+        d = KEY_DIRECTIONS[game_key]
     if d not in DIRECTIONS:
-        raise ToolError("direction must be one of: " + ", ".join(sorted(DIRECTIONS)))
+        raise ToolError("direction must be one of: " + ", ".join(sorted(DIRECTIONS))
+                        + " (or give key: h j k l y u b n)")
     key = DIRECTIONS[d]
     if args.get("run"):
         key = key.upper()
-    count = max(1, min(int(args.get("count", 1) or 1), 50))
+    count = _int_arg(args, "count", 1, 1, 50)
     if SESSION.term is not None and not SESSION.term.finished:
         SESSION.publish_thought(args.get("thought"), "%s %s%s" % (
             "run" if args.get("run") else "move", d, " x%d" % count if count > 1 else ""))
-    SESSION.send([key] * count)
-    SESSION.record_action("move", {"direction": d, "count": count, "run": bool(args.get("run"))},
-                          args.get("thought"))
-    return _result(include_state=bool(args.get("include_state", False)))
+    stop = _stop_flag(args)
+    note = _send_watching([key] * count, stop)
+    SESSION.record_action("move", {"direction": d, "count": count, "run": bool(args.get("run")),
+                                   "stop_when_hurt": stop}, args.get("thought"))
+    return _result(include_state=bool(args.get("include_state", False)), note=note)
 
 
 def tool_get_screen(args):
@@ -902,8 +1043,42 @@ def _learn(fn):
         raise ToolError(str(e))
 
 
+BRIEFING_PAGE = 18000   # characters: a whole briefing can outgrow one tool result
+
+
+def _pages(text, size=BRIEFING_PAGE):
+    """Split text into pages of at most `size` characters, at line ends."""
+    pages, lines, length = [], [], 0
+    for line in text.split("\n"):
+        while len(line) > size:          # a single huge line: cut it
+            if lines:
+                pages.append("\n".join(lines))
+                lines, length = [], 0
+            pages.append(line[:size])
+            line = line[size:]
+        if lines and length + len(line) + 1 > size:
+            pages.append("\n".join(lines))
+            lines, length = [], 0
+        lines.append(line)
+        length += len(line) + 1
+    if lines:
+        pages.append("\n".join(lines))
+    return pages or [""]
+
+
 def tool_get_briefing(args):
-    return _learn(lambda learn, root: learn.briefing(root))
+    pages = _pages(_learn(lambda learn, root: learn.briefing(root)))
+    page = _int_arg(args, "page", 1, 1, 1000)
+    if page > len(pages):
+        raise ToolError("the briefing has %d page%s" % (len(pages), "" if len(pages) == 1 else "s"))
+    if len(pages) == 1:
+        return pages[0]
+    head = "[Briefing, page %d of %d." % (page, len(pages))
+    if page < len(pages):
+        head += " Read every page before you play: next, get_briefing with page=%d.]" % (page + 1)
+    else:
+        head += " This is the last page.]"
+    return head + "\n\n" + pages[page - 1]
 
 
 def tool_propose_strategy(args):
@@ -983,6 +1158,13 @@ def _int_arg(args, name, default, low, high):
     return value
 
 
+def _bool_arg(args, name):
+    value = args.get(name, False)
+    if not isinstance(value, bool):
+        raise ToolError("%s must be true or false" % name)
+    return value
+
+
 def _skill_tool(name, label, run):
     """Make the handler of a skill tool.  `label(args)` is the short text
     for the live view; `run(skills, args)` calls the skill."""
@@ -999,6 +1181,10 @@ def _skill_tool(name, label, run):
             report = run(skills, args)
         except skills.SkillError as e:
             raise ToolError(str(e))
+        if not SESSION.term.finished and SESSION.term.is_waiting():
+            unseen = [a for a in SESSION.recent_attacks(turns=3) if not a["seen"]]
+            if unseen:
+                report["unseen_attackers"] = unseen
         logged = {k: v for k, v in args.items() if k not in ("thought", "include_state")}
         SESSION.record_action(name, logged, args.get("thought"), result=report)
         return _result(include_state=bool(args.get("include_state", False)),
@@ -1015,7 +1201,9 @@ def _travel(skills, args):
         x = _int_arg(args, "x", None, 0, 66)
         y = _int_arg(args, "y", None, 0, 16)
     return skills.travel_to(SESSION, target=target, x=x, y=y,
-                            max_steps=_int_arg(args, "max_steps", 300, 1, 2000))
+                            max_steps=_int_arg(args, "max_steps", 300, 1, 2000),
+                            ignore_monsters=_bool_arg(args, "ignore_monsters"),
+                            through_unknown=_bool_arg(args, "through_unknown"))
 
 
 def _fight(skills, args):
@@ -1029,7 +1217,8 @@ def _fight(skills, args):
 tool_explore = _skill_tool(
     "explore", lambda a: "explore" + (" until %s" % a["until"] if a.get("until") else ""),
     lambda skills, a: skills.explore(SESSION, max_steps=_int_arg(a, "max_steps", 300, 1, 2000),
-                                     until=a.get("until")))
+                                     until=a.get("until"),
+                                     ignore_monsters=_bool_arg(a, "ignore_monsters")))
 tool_travel_to = _skill_tool(
     "travel_to", lambda a: "travel to %s" % (a.get("target") or "%s,%s" % (a.get("x"), a.get("y"))),
     _travel)
@@ -1037,7 +1226,8 @@ tool_take_stairs = _skill_tool(
     "take_stairs", lambda a: "take the stairs %s" % a.get("direction", "down"),
     lambda skills, a: skills.take_stairs(SESSION, direction=str(a.get("direction", "down")),
                                          volcano=bool(a.get("volcano", False)),
-                                         max_steps=_int_arg(a, "max_steps", 300, 1, 2000)))
+                                         max_steps=_int_arg(a, "max_steps", 300, 1, 2000),
+                                         ignore_monsters=_bool_arg(a, "ignore_monsters")))
 tool_fight = _skill_tool("fight", lambda a: "fight", _fight)
 tool_flee = _skill_tool(
     "flee", lambda a: "flee",
@@ -1047,6 +1237,38 @@ tool_buy = _skill_tool(
     "buy", lambda a: "buy " + ", ".join(_string_list(a, "items")) if a.get("items") else "price list",
     lambda skills, a: skills.buy(SESSION, items=_string_list(a, "items"),
                                  leave=bool(a.get("leave", True))))
+
+
+def _pick_up(skills, args):
+    x, y = args.get("x"), args.get("y")
+    if (x is None) != (y is None):
+        raise ToolError("give both x and y, or neither")
+    if x is not None:
+        x = _int_arg(args, "x", None, 0, 66)
+        y = _int_arg(args, "y", None, 0, 16)
+    return skills.pick_up(SESSION, target=args.get("target"), x=x, y=y,
+                          max_steps=_int_arg(args, "max_steps", 300, 1, 2000),
+                          ignore_monsters=_bool_arg(args, "ignore_monsters"))
+
+
+def _pick_up_label(args):
+    if args.get("target"):
+        return "pick up %s" % args["target"]
+    if args.get("x") is not None:
+        return "pick up what is at %s,%s" % (args.get("x"), args.get("y"))
+    return "pick up everything here"
+
+
+def _rest(skills, args):
+    turns = _int_arg(args, "turns", None, 1, 1000)
+    return skills.rest(SESSION, turns=turns, until=str(args.get("until") or "hp"),
+                       max_turns=_int_arg(args, "max_turns", 200, 1, 1000),
+                       ignore_monsters=_bool_arg(args, "ignore_monsters"))
+
+
+tool_pick_up = _skill_tool("pick_up", _pick_up_label, _pick_up)
+tool_rest = _skill_tool(
+    "rest", lambda a: "wait %s turns" % a["turns"] if a.get("turns") else "rest", _rest)
 
 
 TOOLS = [
@@ -1081,6 +1303,7 @@ TOOLS = [
             "properties": {
                 "keys": {"type": "string", "description": "Keys to send, e.g. 'i', 'qa', 'cmle<enter>', '<esc>'."},
                 "include_state": {"type": "boolean", "description": "Also return structured player state."},
+                "stop_when_hurt": STOP_SCHEMA,
                 "thought": THOUGHT_SCHEMA,
             },
             "required": ["keys"],
@@ -1089,17 +1312,19 @@ TOOLS = [
     },
     {
         "name": "move",
-        "description": "Move the player one or more steps in a compass direction (or run until something interesting).",
+        "description": "Move the player one or more steps (or run until something interesting). Give either direction, a compass name (n is north), or key, the game's own movement key (h j k l y u b n, where n is south-east).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "direction": {"type": "string", "enum": ["n", "s", "e", "w", "ne", "nw", "se", "sw"]},
+                "key": {"type": "string", "enum": ["h", "j", "k", "l", "y", "u", "b", "n"],
+                        "description": "Instead of direction: the game's movement key (h west, j south, k north, l east, y north-west, u north-east, b south-west, n south-east)."},
                 "count": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Number of steps (default 1)."},
                 "run": {"type": "boolean", "description": "Run in that direction instead of stepping."},
                 "include_state": {"type": "boolean"},
+                "stop_when_hurt": STOP_SCHEMA,
                 "thought": THOUGHT_SCHEMA,
             },
-            "required": ["direction"],
         },
         "handler": tool_move,
     },
@@ -1111,7 +1336,7 @@ TOOLS = [
     },
     {
         "name": "get_state",
-        "description": "Return structured player state as JSON: stats, HP, gold, dungeon level, position, inventory, active effects, known spells, difficulty, seed, time left, the deepest levels visited, the map as the player knows it (17 rows of 67 characters: # wall, . explored floor, blank unexplored, otherwise the screen's symbols), the monsters shown on the map, the objects known on this level (stairs, buildings, items), the latest messages, what kind of input the game is waiting for and, once the game is over, its outcome.",
+        "description": "Return structured player state as JSON: stats, HP, gold, dungeon level, position, inventory, active effects, known spells, difficulty, seed, time left, the deepest levels visited, the map as the player knows it (17 rows of 67 characters: # wall, . explored floor, blank unexplored, otherwise the screen's symbols), the monsters shown on the map, the objects known on this level (stairs, buildings, items), the latest messages, attacked_by (who hit you in the last few turns, and whether the map showed them: an invisible attacker is named here), what kind of input the game is waiting for and, once the game is over, its outcome.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_get_state,
     },
@@ -1129,11 +1354,12 @@ TOOLS = [
     },
     {
         "name": "explore",
-        "description": "Skill: explore the current level in one call. Walks to the nearest unexplored area again and again, opening doors, picking up gold and ignoring other things it walks over. Stops and says why when the level is explored, a monster appears or comes adjacent, HP drops, the level changes, or the game asks something. The result lists what was discovered.",
+        "description": "Skill: explore the current level in one call. Walks to the nearest unexplored area again and again, opening doors, picking up gold and ignoring other things it walks over (pick_up fetches them). Stops and says why when the level is explored, a monster appears nearby with a way to reach you or a new one comes adjacent, HP drops, the level changes, or the game asks something. The result lists what was discovered. explored means nothing is left that a skill can walk to: beyond lists known traps with more of the level past them. no_path means more is left but monsters (blocked_by) stand in the only known way.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "until": {"type": "string", "description": "Stop as soon as one of these is known: a target name (stairs_down, stairs_up, potion, ...) or a map symbol such as % or !."},
+                "ignore_monsters": IGNORE_SCHEMA,
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Most steps to take (default 300)."},
                 "include_state": {"type": "boolean"},
                 "thought": THOUGHT_SCHEMA,
@@ -1143,13 +1369,15 @@ TOOLS = [
     },
     {
         "name": "travel_to",
-        "description": "Skill: walk to a place by the cheapest known route, avoiding known traps. Give a target (the nearest one known is used) or x and y. Targets: stairs_down, stairs_up, dungeon_entrance, volcano, home, store, bank, college, trading_post, lrs, dealer, elevator, altar, fountain, throne, gold, potion, scroll, book, chest, or any map symbol such as ( or [. A prompt raised by the destination is left for you to answer. Stops early for the same reasons as explore.",
+        "description": "Skill: walk to a place by the cheapest known route, avoiding known traps. Give a target (the nearest one known is used) or x and y. Targets: stairs_down, stairs_up, dungeon_entrance, volcano, home, store, bank, college, trading_post, lrs, dealer, elevator, altar, fountain, throne, gold, potion, scroll, book, chest, or any map symbol such as ( or [. A prompt raised by the destination is left for you to answer (to take an item, use pick_up instead). Stops early for the same reasons as explore. no_path says what is in the way: monsters (blocked_by), known traps (hazards), or a map that does not connect yet.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "target": {"type": "string", "description": "A target name or a one-character map symbol."},
                 "x": {"type": "integer", "description": "Map column, 0-66 (as in get_state's position)."},
                 "y": {"type": "integer", "description": "Map row, 0-16."},
+                "ignore_monsters": IGNORE_SCHEMA,
+                "through_unknown": {"type": "boolean", "description": "With x and y: cross cells not seen yet, feeling the way (for a map lost to a potion of forgetfulness, or a place read off a map elsewhere). Default false."},
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Most steps to take (default 300)."},
                 "include_state": {"type": "boolean"},
                 "thought": THOUGHT_SCHEMA,
@@ -1165,6 +1393,7 @@ TOOLS = [
             "properties": {
                 "direction": {"type": "string", "enum": ["down", "up"], "description": "Default down."},
                 "volcano": {"type": "boolean", "description": "In town, climb down the volcanic shaft instead of entering the dungeon."},
+                "ignore_monsters": IGNORE_SCHEMA,
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000},
                 "include_state": {"type": "boolean"},
                 "thought": THOUGHT_SCHEMA,
@@ -1174,7 +1403,7 @@ TOOLS = [
     },
     {
         "name": "fight",
-        "description": "Skill: attack the nearest visible monster, walking up to it if needed, and keep going until no monster is within reach. Stops with low_hp when HP falls to min_hp of the maximum, so you can flee, heal or cast instead. Melee only: it does not cast spells or use items.",
+        "description": "Skill: attack the nearest visible monster, walking up to it if needed, then go on only against monsters already next to you (it never walks off after a new target). Stops with low_hp when HP falls to min_hp of the maximum or to no more than the biggest blow taken so far, and with hurt_at_range when hurt with nothing visible next to you, so you can flee, heal or cast instead. Melee only: it does not cast spells or use items.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1189,7 +1418,7 @@ TOOLS = [
     },
     {
         "name": "flee",
-        "description": "Skill: step away from the visible monsters until none is within safe_distance. It looks one step ahead only, so it can end in a dead end (result cornered). To run to a specific place, such as the stairs, use travel_to or take_stairs instead.",
+        "description": "Skill: run from the visible monsters until none is within safe_distance. It heads for the place furthest from them that you can reach before they do, planning again after every step, so it leaves a room by the door rather than backing into a corner, and it prefers an unexplored edge of the map to a known dead end. cornered means nowhere you can get to first is further from them than where you stand. It knows only the monsters and map you can see. To run to a specific place, such as the stairs, use travel_to or take_stairs with ignore_monsters instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1214,6 +1443,39 @@ TOOLS = [
             },
         },
         "handler": tool_buy,
+    },
+    {
+        "name": "pick_up",
+        "description": "Skill: walk to things lying on this level and take them, nearest first. With no arguments it fetches everything you know of that can be carried, gold included; target limits it to one kind; x and y fetch the one thing at that cell. Whatever the result, taken lists what was picked up (with its pack slot letter) and left what is still lying there and why. Stops with pack_full when you can carry no more (it does not walk to what it could not carry, but still fetches gold), and early for the same reasons as travel_to. With no arguments it also takes back anything you dropped on this level: name a target, or x and y, to be choosy. It only takes: to drink, read or open something where it lies, use travel_to and answer the question yourself.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Only this kind: potion, scroll, book, chest, gold, or a map symbol such as ( [ = or <."},
+                "x": {"type": "integer", "description": "With y: only the thing at this map column, 0-66."},
+                "y": {"type": "integer", "description": "Map row, 0-16."},
+                "ignore_monsters": IGNORE_SCHEMA,
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Most steps to take in all (default 300)."},
+                "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
+            },
+        },
+        "handler": tool_pick_up,
+    },
+    {
+        "name": "rest",
+        "description": "Skill: wait a turn at a time until HP is full, watching for trouble. Use it instead of sending a row of '.' keys: it stops at once when HP drops or a monster comes into view or next to you, it stops when there is nothing left to recover, and it steps off a known arrow or dart trap first (one fires every turn you stand on it). until picks what to recover; turns waits a set number of turns whatever HP is, to let an effect wear off. It works while blind or confused. Results: rested (nothing left to recover), waited (the turns asked for have passed), max_turns, or the reason it was interrupted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "until": {"type": "string", "enum": ["hp", "spells", "both"], "description": "Rest until HP is full (default), spell points are, or both are."},
+                "turns": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Wait exactly this many turns instead, unless interrupted."},
+                "max_turns": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Most turns to rest when turns is not given (default 200). Time is limited: the result says how many passed."},
+                "ignore_monsters": IGNORE_SCHEMA,
+                "include_state": {"type": "boolean"},
+                "thought": THOUGHT_SCHEMA,
+            },
+        },
+        "handler": tool_rest,
     },
     {
         "name": "summarize_run",
@@ -1249,8 +1511,9 @@ TOOLS = [
     },
     {
         "name": "get_briefing",
-        "description": "Read this before each game of a learning campaign. It names the strategy to play next and what it tests, lists the playbook's lessons, shows every strategy tried with how far each got, summarises the latest games, and sets out the steps of one cycle. Needs the server's --record option.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "Read this before each game of a learning campaign. It names the strategy to play next and what it tests, lists the playbook's lessons, shows every strategy tried with how far each got, summarises the latest games, and sets out the steps of one cycle. A long briefing comes in pages: the first line says how many, and page asks for the next. Needs the server's --record option.",
+        "inputSchema": {"type": "object", "properties": {
+            "page": {"type": "integer", "minimum": 1, "description": "Which page to return (default 1)."}}},
         "handler": tool_get_briefing,
     },
     {
@@ -1350,6 +1613,69 @@ TOOLS = [
 TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
 
 
+def _check_args(tool, args):
+    """Check a call's arguments against the tool's schema before it runs.
+
+    An argument the tool does not have is refused, with the nearest name it
+    does have: a misspelt option would otherwise be dropped without a word,
+    and the call would run with the default.  Values of the wrong type are
+    refused too.  `thought` is let through everywhere, since agents are
+    asked to narrate; tools without one ignore it.
+    """
+    import difflib
+
+    name, schema = tool["name"], tool["inputSchema"]
+    props = schema.get("properties", {})
+    if not isinstance(args, dict):
+        raise ToolError("%s: the arguments must be an object" % name)
+    for key in args:
+        if key in props or key == "thought":
+            continue
+        near = difflib.get_close_matches(str(key), list(props), 1)
+        raise ToolError("%s has no argument %r%s. %s" % (
+            name, key, " (did you mean %r?)" % near[0] if near else "",
+            "Its arguments: " + ", ".join(props) if props else "It takes no arguments."))
+    for key in schema.get("required", ()):
+        if args.get(key) is None:
+            raise ToolError("%s needs the argument %r" % (name, key))
+    for key, value in args.items():
+        if value is None or key not in props:
+            continue
+        want = _type_wanted(props[key], value)
+        if want:
+            raise ToolError("%s must be %s" % (key, want))
+
+
+def _type_wanted(spec, value):
+    """What a value should have been by its schema, or None if it fits."""
+    kind = spec.get("type")
+    if kind in ("integer", "number"):
+        low, high = spec.get("minimum"), spec.get("maximum")
+        open_high = spec.get("exclusiveMaximum")
+        word = "a whole number" if kind == "integer" else "a number"
+        if low is not None and high is not None:
+            word += " from %s to %s" % (low, high)
+        elif low is not None and open_high is not None:
+            word += " from %s up to %s" % (low, open_high)
+        elif low is not None:
+            word += " of at least %s" % low
+        good = not isinstance(value, bool) and isinstance(
+            value, int if kind == "integer" else (int, float))
+        if good and ((low is not None and value < low) or (high is not None and value > high)
+                     or (open_high is not None and value >= open_high)):
+            good = False
+        return None if good else word
+    if kind == "boolean":
+        return None if isinstance(value, bool) else "true or false"
+    if kind == "string":
+        return None if isinstance(value, str) else "a string"
+    if kind == "array":     # one string is taken as a list of one
+        good = isinstance(value, str) or (
+            isinstance(value, list) and all(isinstance(v, str) for v in value))
+        return None if good else "a list of strings"
+    return None
+
+
 # ======================================================================= JSON-RPC
 
 class Server:
@@ -1398,9 +1724,10 @@ class Server:
                                 "move / send_keys and read the returned screen.  When a live view is "
                                 "on, give each new_game / move / send_keys call a short `thought` "
                                 "saying what you are doing and why; viewers see it under the game."
-                                "  Prefer the skill tools (explore, travel_to, take_stairs, fight, "
-                                "flee, buy) to single keys: each does a whole errand in one call "
-                                "and stops, saying why, when something needs your decision."
+                                "  Prefer the skill tools (explore, travel_to, pick_up, take_stairs, "
+                                "fight, flee, rest, buy) to single keys: each does a whole errand "
+                                "in one call and stops, saying why, when something needs your "
+                                "decision."
                                 + ("  Games are recorded and learned from: call get_briefing "
                                    "before a new game and follow the cycle it sets out (list_runs "
                                    "and get_run show earlier games in full), "
@@ -1421,15 +1748,20 @@ class Server:
             tool = TOOLS_BY_NAME.get(name)
             if tool is None:
                 raise RpcError(-32602, "Unknown tool: %s" % name)
-            try:
-                with SESSION.lock:
-                    text = tool["handler"](params.get("arguments") or {})
-                return {"content": [{"type": "text", "text": text}], "isError": False}
-            except ToolError as e:
-                return {"content": [{"type": "text", "text": str(e)}], "isError": True}
-            except Exception:
-                return {"content": [{"type": "text", "text": "Tool failed:\n" + traceback.format_exc()}],
-                        "isError": True}
+            args = params.get("arguments") or {}
+            with SESSION.lock:
+                try:
+                    _check_args(tool, args)
+                    text = tool["handler"](args)
+                except ToolError as e:
+                    SESSION.record_error(name, args, str(e))
+                    return {"content": [{"type": "text", "text": str(e)}], "isError": True}
+                except Exception:
+                    trace = traceback.format_exc()
+                    SESSION.record_error(name, args, "crashed: " + trace.strip().splitlines()[-1])
+                    return {"content": [{"type": "text", "text": "Tool failed:\n" + trace}],
+                            "isError": True}
+            return {"content": [{"type": "text", "text": text}], "isError": False}
         raise RpcError(-32601, "Method not found: %s" % method)
 
     def serve(self, inp):

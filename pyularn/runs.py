@@ -109,7 +109,8 @@ def read_events(path):
 def digest(events):
     """The facts of a run, worked out from its events alone."""
     d = {"levels": [], "level_ups": [], "lowest_hp": None, "thoughts": [],
-         "final_state": None, "final_screen": None, "start_state": None}
+         "final_state": None, "final_screen": None, "start_state": None,
+         "errors": {}}      # (tool, message) -> times a call was refused or failed
     level = xl = None
     for ev in events:
         kind = ev.get("type")
@@ -134,6 +135,9 @@ def digest(events):
                                       "level": s.get("lvl")}
             if ev.get("thought"):
                 d["thoughts"].append({"turn": s.get("turn"), "text": ev["thought"]})
+        elif kind == "error":
+            key = (str(ev.get("tool")), str(ev.get("error") or "").split("\n")[0])
+            d["errors"][key] = d["errors"].get(key, 0) + 1
         elif kind == "end":
             d["final_state"] = ev.get("state")
             screens = ev.get("last_screens") or []
@@ -231,6 +235,12 @@ def render_summary(meta, events):
         lines.append("- Spells known: " + ", ".join(final["known_spells"]))
     if final.get("inventory"):
         lines += ["", "### Final inventory", "", _bullets(final["inventory"])]
+
+    if d["errors"]:
+        worst = sorted(d["errors"].items(), key=lambda kv: (-kv[1], kv[0]))
+        lines += ["", "### Calls the server refused", "",
+                  "%d in all; the game did not move for these." % sum(d["errors"].values()), "",
+                  _bullets("%d× `%s`: %s" % (n, tool, text[:200]) for (tool, text), n in worst[:8])]
 
     if d["thoughts"]:
         lines += ["", "### Last thoughts", "",

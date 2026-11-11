@@ -75,7 +75,7 @@ def rebuild(run_dir, log=None):
     """Play a recorded run again.  Returns (messages, report): the live
     view's messages in order, and how far the replay matched the recording:
     {"actions", "replayed", "mismatch" (None, or where it went wrong)}."""
-    from . import mcp_server as ms
+    from . import mcp_server as ms, skills
 
     meta, events = _load_run(run_dir)
     actions = [e for e in events if e.get("type") == "action"]
@@ -95,6 +95,8 @@ def rebuild(run_dir, log=None):
                 "character_class": str(meta.get("character_class") or "").lower()}
         if meta.get("difficulty") is not None:
             args["difficulty"] = meta["difficulty"]
+        # Skills recorded before the current skills_version behaved differently.
+        skills.behave_as(meta.get("skills_version") or 1)
         ms.tool_new_game(args)
         want, got = compact_state(events[0]["state"]), compact_state(session.state())
         if want != got:
@@ -102,6 +104,9 @@ def rebuild(run_dir, log=None):
             return collector.messages, report
         for ev in actions:
             call = dict(ev.get("args") or {})
+            if ev["tool"] in ("send_keys", "move"):
+                # Recorded before the batch could stop when hurt: send it whole.
+                call.setdefault("stop_when_hurt", False)
             if ev.get("thought"):
                 call["thought"] = ev["thought"]
             tool = ms.TOOLS_BY_NAME.get(ev["tool"])
@@ -121,6 +126,7 @@ def rebuild(run_dir, log=None):
             if log and report["replayed"] % 500 == 0:
                 log("  %d / %d actions" % (report["replayed"], len(actions)))
     finally:
+        skills.behave_as()
         session.stop()
         session.record_dir, session.watch, session.spectator = saved[:3]
         for name, value in (("PYULARN_HOME", saved[3]), ("USER", saved[4])):

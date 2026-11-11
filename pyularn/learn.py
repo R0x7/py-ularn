@@ -705,8 +705,9 @@ CYCLE_STEPS = """\
    strategy's hypotheses, class, seed and the campaign's difficulty are
    filled in for you; do not override them.
 2. Play to win, following the strategy and the playbook. Use the skill
-   tools (`explore`, `travel_to`, `take_stairs`, `fight`, `flee`, `buy`) and
-   `get_state`; use `send_keys` for spells, potions, scrolls and prompts.
+   tools (`explore`, `travel_to`, `pick_up`, `take_stairs`, `fight`, `flee`,
+   `rest`, `buy`) and `get_state`; use `send_keys` for spells, potions,
+   scrolls and prompts. Rest with `rest`, not with a row of `.` keys.
    Keep playing until the game is over. Do not quit a game that can go on.
 3. When it is over, call `summarize_run`. Be exact about what went wrong:
    name the monster, the level, the HP and the decision you would change.

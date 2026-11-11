@@ -16,6 +16,8 @@ Event types in ``events.jsonl``:
             and a compact state (`s`) after the game handled it
 ``state``   the full player state, written when the dungeon level changes
             and every `STATE_EVERY` actions
+``error``   a tool call the server refused or that failed: the tool, its
+            arguments and the message the agent got.  The game did not move
 ``end``     the outcome, the final full state and the last `TAIL_SCREENS`
             screens, which show what led up to the end
 
@@ -30,6 +32,7 @@ import time
 
 STATE_EVERY = 200    # actions between full state snapshots
 TAIL_SCREENS = 30    # screens kept for the `end` event
+ERROR_TEXT = 500     # characters kept of an `error` event's message and of each argument
 
 
 def _now_ms():
@@ -73,6 +76,7 @@ class RunRecorder:
                          started_ms=_now_ms(),
                          ended=None, actions=0, outcome=None)
         self.actions = 0
+        self.errors = 0
         self.closed = False
         self._level = state.get("level_index")
         self._tail = collections.deque(maxlen=TAIL_SCREENS)
@@ -114,6 +118,21 @@ class RunRecorder:
             self._level = level
             self._event("state", n=self.actions, state=state)
 
+    def error(self, tool, args, message, turn=None):
+        """Record a tool call the server refused or that failed.  The game
+        did not move, so it is not an action: `after` is the number of the
+        last action before it."""
+        if self.closed:
+            return
+        self.errors += 1
+        if isinstance(args, dict):
+            args = {str(k)[:40]: (v[:ERROR_TEXT] if isinstance(v, str) else v)
+                    for k, v in list(args.items())[:20]}
+        else:
+            args = str(args)[:ERROR_TEXT]
+        self._event("error", after=self.actions, tool=tool, args=args,
+                    error=str(message)[:ERROR_TEXT], turn=turn)
+
     def close(self, outcome, state, screen):
         """Write the outcome and stop recording."""
         if self.closed:
@@ -123,7 +142,7 @@ class RunRecorder:
         self._event("end", outcome=outcome, state=state, last_screens=list(self._tail))
         self._events.close()
         self.meta.update(ended=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                         actions=self.actions, outcome=outcome)
+                         actions=self.actions, errors=self.errors, outcome=outcome)
         for key in ("character_class", "difficulty"):
             if outcome.get(key) is not None:
                 self.meta[key] = outcome[key]
