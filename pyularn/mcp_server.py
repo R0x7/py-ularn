@@ -118,6 +118,7 @@ def parse_keys(text):
 
 MAX_THOUGHT = 2000
 MESSAGE_ROW = 19   # screen rows: 0-16 the map, 17-18 status, 19-23 messages
+DIRECTION_KEYS = "hjklyubn"   # what "In What Direction?" takes; nothing else ends it
 
 THOUGHT_SCHEMA = {
     "type": "string",
@@ -357,13 +358,20 @@ class GameSession:
 
         self.waiting = None
 
-        def wrap(name, kind):
+        def wrap(name, kind, answers=None):
             original = getattr(ularn_win, name)
 
             def wrapper(*args, **kwargs):
                 previous = self.waiting
-                self.waiting = {"kind": kind,
-                                "answers": args[1] if kind == "prompt" and len(args) > 1 else None}
+                if previous and previous.get("direction"):
+                    # "In What Direction?" reads its key as a command is
+                    # read, but it is still that question being asked.
+                    return original(*args, **kwargs)
+                self.waiting = {"kind": kind, "answers": answers}
+                if kind == "prompt" and answers is None and len(args) > 1:
+                    self.waiting["answers"] = args[1]
+                if name == "get_dir_input":
+                    self.waiting["direction"] = True
                 try:
                     return original(*args, **kwargs)
                 finally:
@@ -373,6 +381,7 @@ class GameSession:
 
         wrap("get_normal_input", "command")
         wrap("get_prompt_input", "prompt")
+        wrap("get_dir_input", "prompt", DIRECTION_KEYS)
 
     def input_state(self):
         """What the next key will be read as, for agents."""
@@ -599,7 +608,7 @@ class GameSession:
     def state(self):
         """Structured snapshot of the player.  Only valid while the game
         thread is blocked waiting for input (or finished)."""
-        from . import player, dungeon, itm, show, spell, ularn_game, ularn_win
+        from . import player, dungeon, itm, show, skills, spell, ularn_game, ularn_win
 
         c = player.c
         lev = dungeon.level
@@ -636,15 +645,7 @@ class GameSession:
                 inv.append(text)
         st["inventory"] = inv
 
-        effects = []
-        for e in ularn_win._get_bot_data():
-            if c[e.typ]:
-                effects.append(e.string.strip())
-        for idx, name in ((player.BLINDCOUNT, "Blind"), (player.CONFUSE, "Confused"),
-                          (player.AGGRAVATE, "Aggravate")):
-            if c[idx]:
-                effects.append(name)
-        st["effects"] = effects
+        st["effects"] = skills.active_effects()
         st["attacked_by"] = self.recent_attacks()
 
         st["known_spells"] = [
@@ -652,7 +653,6 @@ class GameSession:
             for i in range(spell.SPELL_COUNT) if player.spelknow[i]
         ]
         st["monsters"] = _visible_monsters()
-        from . import skills
         st["objects"] = skills.known_objects(1000)
         known = self.item_facts(st)
         if known:
@@ -1379,14 +1379,21 @@ def _pick_up_label(args):
 
 def _rest(skills, args):
     turns = _int_arg(args, "turns", None, 1, 1000)
+    effect = args.get("effect")
     return skills.rest(SESSION, turns=turns, until=str(args.get("until") or "hp"),
                        max_turns=_int_arg(args, "max_turns", 200, 1, 1000),
-                       ignore_monsters=_bool_arg(args, "ignore_monsters"))
+                       ignore_monsters=_bool_arg(args, "ignore_monsters"),
+                       effect=None if effect is None else str(effect))
+
+
+def _rest_label(args):
+    if args.get("effect"):
+        return "wait for %s to end" % args["effect"]
+    return "wait %s turns" % args["turns"] if args.get("turns") else "rest"
 
 
 tool_pick_up = _skill_tool("pick_up", _pick_up_label, _pick_up)
-tool_rest = _skill_tool(
-    "rest", lambda a: "wait %s turns" % a["turns"] if a.get("turns") else "rest", _rest)
+tool_rest = _skill_tool("rest", _rest_label, _rest)
 
 
 TOOLS = [
@@ -1581,12 +1588,13 @@ TOOLS = [
     },
     {
         "name": "rest",
-        "description": "Skill: wait a turn at a time until HP is full, watching for trouble. Use it instead of sending a row of '.' keys: it stops at once when HP drops or a monster comes into view or next to you, it stops when there is nothing left to recover, and it steps off a known arrow or dart trap first (one fires every turn you stand on it). until picks what to recover; turns waits a set number of turns whatever HP is, to let an effect wear off. It works while blind or confused. Results: rested (nothing left to recover), waited (the turns asked for have passed), max_turns, or the reason it was interrupted.",
+        "description": "Skill: wait a turn at a time until HP is full, watching for trouble. Use it instead of sending a row of '.' keys: it stops at once when HP drops or a monster comes into view or next to you, it stops when there is nothing left to recover, and it steps off a known arrow or dart trap first (one fires every turn you stand on it). until picks what to recover; turns waits a set number of turns whatever HP is; effect waits until a timed effect has ended (a time stop, before taking stairs or attacking, say). It works while blind or confused. Results: rested (nothing left to recover), waited (the turns asked for have passed), effect_ended, max_turns, or the reason it was interrupted.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "until": {"type": "string", "enum": ["hp", "spells", "both"], "description": "Rest until HP is full (default), spell points are, or both are."},
                 "turns": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Wait exactly this many turns instead, unless interrupted."},
+                "effect": {"type": "string", "description": "Wait until this effect has ended instead, for at most max_turns waits: its name as get_state's effects list it, such as Time Stop, Hold Monst or Stealth. Not with turns. During a time stop the game clock stands still, so the result's turns stays 0 and steps counts the waits."},
                 "max_turns": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Most turns to rest when turns is not given (default 200). Time is limited: the result says how many passed."},
                 "ignore_monsters": IGNORE_SCHEMA,
                 "include_state": {"type": "boolean"},

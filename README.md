@@ -86,7 +86,7 @@ Claude Desktop / other clients (`mcpServers` config):
 | `take_stairs` | Skill: go to the known stairs and take them, `direction` `down` or `up`. |
 | `fight` | Skill: attack the nearest visible monster, then only what is next to you, until none is left or HP falls to `min_hp`. |
 | `flee` | Skill: run from visible monsters, by a planned route, until none is within `safe_distance`. |
-| `rest` | Skill: wait until HP is full (`until`: `hp`, `spells` or `both`), or for a set number of `turns`, stopping at the first sign of trouble. |
+| `rest` | Skill: wait until HP is full (`until`: `hp`, `spells` or `both`), for a set number of `turns`, or until a timed `effect` such as a time stop has ended, stopping at the first sign of trouble. |
 | `buy` | Skill: buy `items` at the DND store in town, or return its price list. |
 | `summarize_run` | Write a finished game's post-mortem: a one-sentence `takeaway`, then `synopsis`, `went_wrong`, `worked`, `next_try`. Needs `--record`. |
 | `list_runs` | Recorded games, newest first, with how each ended and its one-line takeaway (`full` adds the synopsis and the rest). Filters: `difficulty`, `strategy`, `limit`. Needs `--record`. |
