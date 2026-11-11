@@ -28,6 +28,14 @@ import importlib
 
 ESC = "\x1b"
 
+# How the skills behave.  Runs record it, so a replay of an older run can
+# ask for the behaviour it was recorded with (LEGACY): version 1 crossed
+# express elevators, stayed on a trap that had just hurt, tried four times
+# to step into something unseen, and let `fight` walk off after new
+# targets until HP fell to min_hp.
+VERSION = 2
+LEGACY = False
+
 # (dx, dy) -> movement key.  y grows downwards, as on the screen.
 KEYS = {(0, -1): "k", (0, 1): "j", (1, 0): "l", (-1, 0): "h",
         (1, -1): "u", (-1, -1): "y", (1, 1): "n", (-1, 1): "b"}
@@ -68,7 +76,15 @@ def hidden_ids():
 
 
 def hazard_ids():
-    return _ids("OPIT", "OTELEPORTER", "OTRAPARROW", "ODARTRAP", "OTRAPDOOR", "OANNIHILATION")
+    """Known things a walk must not cross: traps, and express elevators,
+    which carry you off as soon as you step on them."""
+    traps = ("OPIT", "OTELEPORTER", "OTRAPARROW", "ODARTRAP", "OTRAPDOOR", "OANNIHILATION")
+    return _ids(*traps) if LEGACY else _ids(*traps, "OELEVATORUP", "OELEVATORDOWN")
+
+
+def trap_ids():
+    """Known traps that hurt you again for every turn you stay on them."""
+    return _ids("OTRAPARROW", "ODARTRAP")
 
 
 def gold_ids():
@@ -296,6 +312,7 @@ class Runner:
     def __init__(self, session):
         self.s = session
         self.steps = 0
+        self.notes = {}     # extra facts for the report, gathered on the way
 
     # ------------------------------------------------------------ reading
     def pos(self):
@@ -341,6 +358,7 @@ class Runner:
 
     def report(self, result, **extra):
         out = {"result": result, "steps": self.steps}
+        out.update(self.notes)
         out.update(extra)
         if not self.over():
             x, y = self.pos()
@@ -438,6 +456,7 @@ def _walk(r, max_steps, next_goal, arrived):
         _, came = reach(start, goal, r.monster_cells())
         cells = path_to(came, start, goal)
         if not cells:
+            _explain_no_path(r, start, goal)
             return "no_path"
         last = cells[0] == goal and arrived(goal)
         answered = r.step(cells[0], leave_prompt=last)
@@ -446,17 +465,55 @@ def _walk(r, max_steps, next_goal, arrived):
             return why
         if r.pos() == goal and last:
             return "arrived"
+        if why == "hurt" and not LEGACY:
+            _off_trap(r)
         if not answered:
             return "prompt"
         if why:
             return why
         if r.pos() == start:
+            if seen(*cells[0]) != E.itm.OCLOSEDDOOR and not LEGACY:
+                # Not a stuck door: the step was taken as an attack on
+                # something the screen does not show.  Trying again would
+                # keep attacking it, so stop and say so.
+                r.notes["note"] = ("could not step to (%d, %d): something you cannot see "
+                                   "is probably there, and moving into it attacks it"
+                                   % cells[0])
+                return "blocked"
             stuck += 1
             if stuck >= 4:
+                r.notes["note"] = "the door at (%d, %d) would not open" % cells[0]
                 return "blocked"
         else:
             stuck = 0
     return "max_steps"
+
+
+def _off_trap(r):
+    """After being hurt, do not stay on a trap that will hurt again."""
+    if seen(*r.pos()) not in trap_ids():
+        return
+    trap = r.pos()
+    if _step_aside(r):
+        r.notes["stepped_off_trap"] = {"x": trap[0], "y": trap[1]}
+    else:
+        r.notes["on_trap"] = {"x": trap[0], "y": trap[1],
+                              "note": "you are standing on a trap that hurts every turn; step off"}
+
+
+def _explain_no_path(r, start, goal):
+    """Say why there is no path: monsters in the way, or a map that does not
+    connect (unexplored cells or known traps between here and there)."""
+    _, came = reach(start, goal)
+    cells = path_to(came, start, goal)
+    if cells:
+        on_path = set(cells)
+        blockers = [m for m in visible_monsters() if (m["x"], m["y"]) in on_path]
+        r.notes["blocked_by"] = blockers
+        r.notes["reason"] = "the only known way is through the monsters in blocked_by"
+    else:
+        r.notes["reason"] = ("the known map does not connect here: explore more, or the way "
+                             "is through a known trap or elevator, which skills will not cross")
 
 
 def nearest(ids):
@@ -607,12 +664,17 @@ def take_stairs(session, direction="down", volcano=False, max_steps=300):
 
 
 def fight(session, max_turns=40, min_hp=0.35, reach_distance=5):
-    """Attack the nearest visible monster until none is within reach.
+    """Attack the nearest visible monster, and then whatever is next to you.
 
-    Walks up to monsters within `reach_distance` and attacks by moving into
-    them.  Stops with "low_hp" once HP falls to `min_hp` (a fraction of the
-    maximum).  Results: clear, no_monsters, low_hp, unreachable, max_turns,
-    prompt, level_changed, game_over.
+    Walks up to the nearest monster within `reach_distance` and attacks it
+    by moving into it.  Once something has been killed it only goes on
+    against monsters already next to you: it never walks off after a new
+    target.  It stops with "low_hp" once HP falls to `min_hp` (a fraction of
+    the maximum) or to no more than the biggest single blow taken so far,
+    and with "hurt_at_range" when HP drops with no visible monster next to
+    you (a breath, a spell, or something invisible).  Results: clear,
+    no_monsters, low_hp, hurt_at_range, unreachable, max_turns, prompt,
+    level_changed, game_over.
     """
     if not 0 <= min_hp < 1:
         raise SkillError("min_hp is a fraction of maximum HP, from 0 up to 1")
@@ -621,7 +683,8 @@ def fight(session, max_turns=40, min_hp=0.35, reach_distance=5):
     r.check_ready()
     level = E.dungeon.level
     exp = player.c[player.EXPERIENCE]
-    hp = r.hp()
+    hp = last_hp = r.hp()
+    worst = 0
     result = "max_turns"
     while r.steps < max_turns:
         if r.over():
@@ -630,10 +693,19 @@ def fight(session, max_turns=40, min_hp=0.35, reach_distance=5):
         if E.dungeon.level != level:
             result = "level_changed"
             break
-        if r.hp() <= min_hp * r.hp_max():
+        now = r.hp()
+        lost, last_hp = last_hp - now, now
+        mons = visible_monsters()
+        if lost > 0 and not LEGACY:
+            worst = max(worst, lost)
+            if not mons or mons[0]["distance"] > 1:
+                result = "hurt_at_range"
+                break
+        if now <= min_hp * r.hp_max() or (worst and now <= worst):
             result = "low_hp"
             break
-        near = [m for m in visible_monsters() if m["distance"] <= reach_distance]
+        killed = player.c[player.EXPERIENCE] > exp and not LEGACY
+        near = [m for m in mons if m["distance"] <= (1 if killed else reach_distance)]
         if not near:
             result = "clear" if r.steps else "no_monsters"
             break
@@ -654,7 +726,8 @@ def fight(session, max_turns=40, min_hp=0.35, reach_distance=5):
             break
     out = {"turns": r.steps}
     if not r.over():
-        out.update(experience_gained=player.c[player.EXPERIENCE] - exp, hp_lost=hp - r.hp())
+        out.update(experience_gained=player.c[player.EXPERIENCE] - exp, hp_lost=hp - r.hp(),
+                   biggest_hit=worst)
     return r.report(result, **out)
 
 

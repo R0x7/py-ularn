@@ -273,6 +273,43 @@ class DeathTest(unittest.TestCase):
         self.feed_until_over()
         self.assertEqual(s.final_outcome(), out)
 
+    def test_batch_stops_when_hurt(self):
+        from pyularn import mcp_server, player
+        import pyularn.ularn as ularn
+        s = self.session
+        saved_session, saved_parse = mcp_server.SESSION, ularn.parse
+
+        def hurt(action):
+            player.c[player.HP] -= 1
+
+        mcp_server.SESSION, ularn.parse = s, hurt
+        try:
+            player.c[player.HP] = player.c[player.HPMAX] = 50
+            out = mcp_server.tool_send_keys({"keys": "....."})
+            self.assertIn("Stopped after 1 of 5 keys: HP fell from 50 to 49", out)
+            self.assertEqual(player.c[player.HP], 49)
+            out = mcp_server.tool_move({"direction": "n", "count": 4})
+            self.assertIn("Stopped after 1 of 4 keys", out)
+            self.assertEqual(player.c[player.HP], 48)
+            out = mcp_server.tool_send_keys({"keys": ".....", "stop_when_hurt": False})
+            self.assertNotIn("Stopped", out)
+            self.assertEqual(player.c[player.HP], 43)
+            with self.assertRaises(mcp_server.ToolError):
+                mcp_server.tool_send_keys({"keys": "..", "stop_when_hurt": "yes"})
+        finally:
+            mcp_server.SESSION, ularn.parse = saved_session, saved_parse
+        ularn.parse = saved_parse
+        # Unhurt, every key is sent.
+        mcp_server.SESSION = s
+        try:
+            turn = s.state()["turns"]
+            out = mcp_server.tool_send_keys({"keys": "..."})
+            self.assertNotIn("Stopped", out)
+            self.assertIn("waiting for a command", out)
+            self.assertGreater(s.state()["turns"], turn)
+        finally:
+            mcp_server.SESSION = saved_session
+
     def test_life_protection_is_not_a_death(self):
         from pyularn import monster, player, scores
         import pyularn.ularn as ularn
@@ -335,6 +372,7 @@ class RecordTest(unittest.TestCase):
             m = meta()
             self.assertEqual((m["seed"], m["character_class"], m["difficulty"]), (21, "Dwarf", 1))
             self.assertIsNone(m["outcome"])
+            self.assertEqual(m["skills_version"], 2)   # replays use the matching skill behaviour
 
             c.call("move", direction="e", count=2, thought="Stretching my legs.")
             c.call("send_keys", keys="i")
@@ -345,10 +383,11 @@ class RecordTest(unittest.TestCase):
             self.assertNotIn("result", ev[1])
             self.assertEqual(ev[0]["state"]["seed"], 21)
             self.assertEqual(ev[1]["tool"], "move")
-            self.assertEqual(ev[1]["args"], {"direction": "e", "count": 2, "run": False})
+            self.assertEqual(ev[1]["args"], {"direction": "e", "count": 2, "run": False,
+                                             "stop_when_hurt": True})
             self.assertEqual(ev[1]["thought"], "Stretching my legs.")
             self.assertEqual(ev[1]["s"]["lvl"], 0)
-            self.assertEqual(ev[2]["args"], {"keys": "i"})
+            self.assertEqual(ev[2]["args"], {"keys": "i", "stop_when_hurt": True})
             self.assertNotIn("thought", ev[2])
 
             # A skill is one action, with why it stopped.

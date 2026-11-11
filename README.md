@@ -74,8 +74,8 @@ Claude Desktop / other clients (`mcpServers` config):
 | Tool | What it does |
 |---|---|
 | `new_game` | Start a game. Options: `character_class` (a-h or ogre/wizard/klingon/elf/rogue/adventurer/dwarf/rambo), `seed` for a reproducible game, `difficulty` (0 to 100), `player_name`, `skip_intro`. Returns the screen and the player state. |
-| `send_keys` | Send keystrokes, e.g. `"i"`, `"qa"`, `"cmle<enter>"`, `"<esc>"`. Special keys: `<esc> <enter> <space> <bs> <tab> <up> <down> <left> <right> <c-r>`. Returns the new screen. |
-| `move` | Step or run in a compass direction (`n s e w ne nw se sw`), with an optional `count`. |
+| `send_keys` | Send keystrokes, e.g. `"i"`, `"qa"`, `"cmle<enter>"`, `"<esc>"`. Special keys: `<esc> <enter> <space> <bs> <tab> <up> <down> <left> <right> <c-r>`. Returns the new screen. Stops sending the rest of the keys as soon as HP drops, and says which were not sent (`stop_when_hurt: false` sends the whole batch). |
+| `move` | Step or run in a compass direction (`n s e w ne nw se sw`), with an optional `count`. Like `send_keys`, a `count` stops early when HP drops. |
 | `get_screen` | The current 80x24 screen. |
 | `get_state` | JSON: HP, stats, gold, AC/WC, dungeon level, position, turns, inventory, active effects, known spells, plus `seed`, `difficulty`, `time` left, the `deepest` levels visited, the `map`, the `monsters` and `objects` on it, the latest `messages` and, once the game is over, its `outcome`. |
 | `key_reference` | Command list, map legend and goal. |
@@ -83,7 +83,7 @@ Claude Desktop / other clients (`mcpServers` config):
 | `explore` | Skill: explore the level until something needs a decision. Option `until` stops when a target is found. |
 | `travel_to` | Skill: walk to a `target` (name or map symbol) or to `x`, `y`. |
 | `take_stairs` | Skill: go to the known stairs and take them, `direction` `down` or `up`. |
-| `fight` | Skill: attack the nearest visible monster until none is in reach, or HP falls to `min_hp`. |
+| `fight` | Skill: attack the nearest visible monster, then only what is next to you, until none is left or HP falls to `min_hp`. |
 | `flee` | Skill: step away from visible monsters until none is within `safe_distance`. |
 | `buy` | Skill: buy `items` at the DND store in town, or return its price list. |
 | `summarize_run` | Write a finished game's post-mortem: `synopsis`, `went_wrong`, `worked`, `next_try`. Needs `--record`. |
@@ -122,9 +122,9 @@ position, HP and the monsters in view.
 | Skill | Stops with |
 |---|---|
 | `explore` | `explored` (nothing left to reach), `found` (the `until` target is known) |
-| `travel_to` | `arrived` (a question asked by the destination is left for the agent), `not_found`, `no_path` |
+| `travel_to` | `arrived` (a question asked by the destination is left for the agent), `not_found`, `no_path` (with `blocked_by`, the monsters in the only known way, or a `reason`) |
 | `take_stairs` | `changed_level`, `not_found` (explore first), `refused` |
-| `fight` | `clear`, `no_monsters`, `low_hp`, `unreachable`, `max_turns` |
+| `fight` | `clear`, `no_monsters`, `low_hp` (HP at `min_hp`, or no more than the biggest blow taken so far), `hurt_at_range` (hurt with nothing visible next to you: a breath, a spell or something invisible), `unreachable`, `max_turns` |
 | `flee` | `safe`, `cornered`, `max_steps` |
 | `buy` | `done` (with `bought` and `failed`, each with a reason), `listed`, `refused` (taxes owed) |
 
@@ -137,9 +137,16 @@ What the skills will and will not do:
 - They only press keys, so they can do nothing a player could not.
 - They use only what the player knows: the map as drawn, and the monsters
   on it. Undiscovered traps and unseen monsters are invisible to them.
-- They never route through a known trap, pit or teleporter, they open
-  doors, they pick up gold, and they answer "ignore" to anything else they
-  walk over.
+- They never route through a known trap, pit, teleporter or express
+  elevator, they open doors, they pick up gold, and they answer "ignore"
+  to anything else they walk over.
+- A walk that is hurt while standing on a trap steps off it before
+  stopping (`stepped_off_trap`). A step that does not happen, other than
+  at a stuck door, stops the walk at once with `blocked`: something unseen
+  is there, and walking into it again would attack it.
+- Once `fight` has killed something it never walks off after another
+  target; it only goes on against monsters already next to you. It cannot
+  stop a single blow bigger than your HP.
 - They will not start while the game is asking a question, or while the
   character is blind or confused.
 - `fight` is melee only, and `flee` looks one step ahead, so it can run

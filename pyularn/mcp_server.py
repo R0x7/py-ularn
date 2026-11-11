@@ -124,6 +124,12 @@ THOUGHT_SCHEMA = {
                    "the view is on, give one with most moves, not only at milestones.",
 }
 
+STOP_SCHEMA = {
+    "type": "boolean",
+    "description": "Stop sending the remaining keys as soon as HP drops (default true). "
+                   "The result says how many keys were sent and which were not.",
+}
+
 # With the live view on, a game call's result reminds the agent to narrate
 # after this many calls in a row without a thought (and every as many after).
 QUIET_NUDGE = 8
@@ -394,7 +400,7 @@ class GameSession:
                 "requested_difficulty": requested_difficulty,
                 "strategy": strategy, "hypotheses": list(hypotheses),
                 "notes": None,
-                "version": header.PYULARN_VERSION}
+                "version": header.PYULARN_VERSION, "skills_version": _skills_version()}
         try:
             self.recorder = recorder.RunRecorder(self.record_dir, meta, state)
         except OSError:
@@ -496,6 +502,14 @@ class GameSession:
         if self.term.finished:
             return "game over (exit code %s)" % self.exit_code
         if self.term.is_waiting():
+            # Say what the next key will be read as: text left on the screen
+            # by an earlier question can look like a question still waiting.
+            w = self.input_state()
+            if w["kind"] == "command":
+                return "waiting for a command (any question still shown on the screen is over)"
+            if w["kind"] == "prompt":
+                return "waiting for an answer to the question on the screen: " + " ".join(
+                    w.get("answers") or ())
             return "waiting for input"
         return "busy"
 
@@ -525,7 +539,8 @@ class GameSession:
                 "ac": c[player.AC], "wc": c[player.WCLASS],
                 "level": c[player.LEVEL], "experience": c[player.EXPERIENCE],
                 "gold": c[player.GOLD], "bank": c[player.BANKACCOUNT],
-                "str": c[player.STRENGTH], "int": c[player.INTELLIGENCE],
+                "str": c[player.STRENGTH] + c[player.STREXTRA], "str_base": c[player.STRENGTH],
+                "int": c[player.INTELLIGENCE],
                 "wis": c[player.WISDOM], "con": c[player.CONSTITUTION],
                 "dex": c[player.DEXTERITY], "cha": c[player.CHARISMA],
             },
@@ -587,6 +602,12 @@ def _deepest():
     dungeon_levels = [i for i in range(1, dungeon.MAXLEVEL) if been[i]]
     volcano_levels = [i - dungeon.DBOTTOM for i in range(dungeon.MAXLEVEL, dungeon.NLEVELS) if been[i]]
     return {"dungeon": max(dungeon_levels, default=0), "volcano": max(volcano_levels, default=0)}
+
+
+def _skills_version():
+    from . import skills
+
+    return skills.VERSION
 
 
 def _visible_monsters():
@@ -762,15 +783,54 @@ def tool_new_game(args):
     return _result(include_state=True, note=note)
 
 
+def _stop_flag(args):
+    value = args.get("stop_when_hurt", True)
+    if not isinstance(value, bool):
+        raise ToolError("stop_when_hurt must be true or false")
+    return value
+
+
+def _send_watching(keys, stop_when_hurt):
+    """Send keys; with `stop_when_hurt`, one at a time, stopping as soon as
+    HP drops or the game ends.  The engine never looks ahead in the key
+    queue, so this plays exactly as sending them all at once would, up to
+    the stop.  Returns a note for the result when keys were left unsent."""
+    if not stop_when_hurt or len(keys) == 1:
+        SESSION.send(keys)
+        return None
+    from . import player
+
+    term = SESSION.term
+    before = player.c[player.HP] if term.is_waiting() else None
+    for i, key in enumerate(keys):
+        SESSION.send([key])
+        if term.finished:
+            rest = keys[i + 1:]
+            return ("The game ended after %d of %d keys; the rest were not sent." % (i + 1, len(keys))
+                    if rest else None)
+        if not term.is_waiting():
+            before = None
+            continue
+        hp = player.c[player.HP]
+        if before is not None and hp < before and i + 1 < len(keys):
+            return ("Stopped after %d of %d keys: HP fell from %d to %d. Not sent: %s "
+                    "(pass stop_when_hurt false to send a whole batch regardless)."
+                    % (i + 1, len(keys), before, hp, _keys_label(keys[i + 1:], 40)))
+        before = hp
+    return None
+
+
 def tool_send_keys(args):
     keys = parse_keys(str(args.get("keys", "")))
     if not keys:
         raise ToolError("keys is empty")
     if SESSION.term is not None and not SESSION.term.finished:
         SESSION.publish_thought(args.get("thought"), "keys " + _keys_label(keys))
-    SESSION.send(keys)
-    SESSION.record_action("send_keys", {"keys": str(args.get("keys", ""))}, args.get("thought"))
-    return _result(include_state=bool(args.get("include_state", False)))
+    stop = _stop_flag(args)
+    note = _send_watching(keys, stop)
+    SESSION.record_action("send_keys", {"keys": str(args.get("keys", "")), "stop_when_hurt": stop},
+                          args.get("thought"))
+    return _result(include_state=bool(args.get("include_state", False)), note=note)
 
 
 def tool_move(args):
@@ -784,10 +844,11 @@ def tool_move(args):
     if SESSION.term is not None and not SESSION.term.finished:
         SESSION.publish_thought(args.get("thought"), "%s %s%s" % (
             "run" if args.get("run") else "move", d, " x%d" % count if count > 1 else ""))
-    SESSION.send([key] * count)
-    SESSION.record_action("move", {"direction": d, "count": count, "run": bool(args.get("run"))},
-                          args.get("thought"))
-    return _result(include_state=bool(args.get("include_state", False)))
+    stop = _stop_flag(args)
+    note = _send_watching([key] * count, stop)
+    SESSION.record_action("move", {"direction": d, "count": count, "run": bool(args.get("run")),
+                                   "stop_when_hurt": stop}, args.get("thought"))
+    return _result(include_state=bool(args.get("include_state", False)), note=note)
 
 
 def tool_get_screen(args):
@@ -1081,6 +1142,7 @@ TOOLS = [
             "properties": {
                 "keys": {"type": "string", "description": "Keys to send, e.g. 'i', 'qa', 'cmle<enter>', '<esc>'."},
                 "include_state": {"type": "boolean", "description": "Also return structured player state."},
+                "stop_when_hurt": STOP_SCHEMA,
                 "thought": THOUGHT_SCHEMA,
             },
             "required": ["keys"],
@@ -1089,7 +1151,7 @@ TOOLS = [
     },
     {
         "name": "move",
-        "description": "Move the player one or more steps in a compass direction (or run until something interesting).",
+        "description": "Move the player one or more steps in a compass direction (or run until something interesting). Directions are compass names (n is north); to send the game's own movement keys (h j k l y u b n) use send_keys.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1097,6 +1159,7 @@ TOOLS = [
                 "count": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Number of steps (default 1)."},
                 "run": {"type": "boolean", "description": "Run in that direction instead of stepping."},
                 "include_state": {"type": "boolean"},
+                "stop_when_hurt": STOP_SCHEMA,
                 "thought": THOUGHT_SCHEMA,
             },
             "required": ["direction"],

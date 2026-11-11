@@ -207,6 +207,98 @@ class SkillsTest(unittest.TestCase):
         with self.assertRaises(sk.SkillError):
             sk.fight(s, min_hp=1.5)
 
+    def test_fight_does_not_roam(self):
+        sk, s, monster = self.skills, self.s, self.E.monster
+        self.toughen()
+        x, y = self.pos()
+        cells = self.free_cells_east(4)
+        self.put_monster(cells[0], monster.JACKAL)               # next to you
+        self.put_monster(cells[3], monster.JACKAL, hp=500)       # further off, asleep
+        r = sk.fight(s)
+        self.assertEqual(r["result"], "clear", r)
+        self.assertGreater(r["experience_gained"], 0)
+        self.assertEqual(self.pos(), (x, y))                     # it did not walk off after the next one
+
+    def test_fight_stops_before_a_blow_it_cannot_take(self):
+        sk, s, p, monster = self.skills, self.s, self.E.player, self.E.monster
+        import pyularn.ularn as ularn
+        x, y = self.pos()
+        self.put_monster((x + 1, y), monster.JACKAL, awake=True, hp=5000)
+        p.c[p.HP] = p.c[p.HPMAX] = 100
+        orig = ularn.parse
+
+        def parse(action):           # every turn something hits for 30
+            orig(action)
+            p.c[p.HP] -= 30
+        ularn.parse = parse
+        try:
+            r = sk.fight(s, min_hp=0.05)
+        finally:
+            ularn.parse = orig
+        # 100 -> 70 -> 40: a third blow of 30 could leave 10, a fourth would kill.
+        self.assertEqual(r["result"], "low_hp", r)
+        self.assertLessEqual(r["hp"], r["biggest_hit"])
+        self.assertGreater(r["hp"], 0)
+
+    def test_fight_stops_when_hurt_from_afar(self):
+        sk, s, p, monster = self.skills, self.s, self.E.player, self.E.monster
+        import pyularn.ularn as ularn
+        self.toughen()
+        cells = self.free_cells_east(4)
+        self.put_monster(cells[3], monster.JACKAL, hp=500)
+        orig = ularn.parse
+
+        def parse(action):           # something unseen hits as you walk
+            orig(action)
+            p.c[p.HP] -= 5
+        ularn.parse = parse
+        try:
+            r = sk.fight(s)
+        finally:
+            ularn.parse = orig
+        self.assertEqual((r["result"], r["turns"]), ("hurt_at_range", 1), r)
+
+    def test_walks_stop_safely(self):
+        sk, s, itm, d, monster = self.skills, self.s, self.E.itm, self.E.dungeon, self.E.monster
+        self.toughen()
+        cells = self.free_cells_east(4)
+
+        # The goal, cells[1], can only be reached through cells[0].
+        gx, gy = cells[1]
+        walls = [(gx + dx, gy + dy) for dx, dy in sk.STEPS if (gx + dx, gy + dy) != cells[0]]
+        for wx, wy in walls:
+            d.item[wx][wy] = d.know[wx][wy] = itm.OWALL
+
+        # An invisible monster in the way: one try, not four blows.
+        self.put_monster(cells[0], monster.INVISIBLESTALKER, awake=True, hp=5000)
+        self.E.player.c[self.E.player.HOLDMONST] = 1000
+        r = sk.travel_to(s, x=cells[1][0], y=cells[1][1])
+        self.assertEqual((r["result"], r["steps"]), ("blocked", 1), r)
+        self.assertIn("cannot see", r["note"])
+        d.mitem[cells[0][0]][cells[0][1]].mon = 0
+
+        # A visible monster plugging the only way: no_path names it.
+        self.put_monster(cells[0], monster.JACKAL, hp=500)
+        r = sk.travel_to(s, x=cells[1][0], y=cells[1][1])
+        self.assertEqual(r["result"], "no_path", r)
+        self.assertEqual([(m["x"], m["y"]) for m in r["blocked_by"]], [cells[0]])
+        d.mitem[cells[0][0]][cells[0][1]].mon = 0
+        self.E.player.c[self.E.player.HOLDMONST] = 0
+
+        # An arrow trap you did not know of, on the only way: the walk
+        # stops after it hurts you, and not standing on it.
+        d.item[cells[0][0]][cells[0][1]] = itm.OTRAPARROW
+        r = sk.travel_to(s, x=cells[1][0], y=cells[1][1])
+        self.assertEqual(r["result"], "hurt", r)
+        self.assertEqual(r["stepped_off_trap"], {"x": cells[0][0], "y": cells[0][1]})
+        self.assertNotEqual(self.pos(), cells[0])
+        for wx, wy in walls:
+            d.item[wx][wy] = d.know[wx][wy] = itm.ONOTHING
+
+        # A known express elevator is walked around like a trap.
+        d.item[cells[2][0]][cells[2][1]] = d.know[cells[2][0]][cells[2][1]] = itm.OELEVATORUP
+        self.assertIsNone(sk.step_cost(*cells[2]))
+
     def test_flee(self):
         sk, s, monster = self.skills, self.s, self.E.monster
         self.assertEqual(sk.flee(s)["result"], "safe")       # nothing to flee from
