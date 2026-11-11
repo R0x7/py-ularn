@@ -75,13 +75,13 @@ Claude Desktop / other clients (`mcpServers` config):
 |---|---|
 | `new_game` | Start a game. Options: `character_class` (a-h or ogre/wizard/klingon/elf/rogue/adventurer/dwarf/rambo), `seed` for a reproducible game, `difficulty` (0 to 100), `player_name`, `skip_intro`. Returns the screen and the player state. |
 | `send_keys` | Send keystrokes, e.g. `"i"`, `"qa"`, `"cmle<enter>"`, `"<esc>"`. Special keys: `<esc> <enter> <space> <bs> <tab> <up> <down> <left> <right> <c-r>`. Returns the new screen. Stops sending the rest of the keys as soon as HP drops, and says which were not sent (`stop_when_hurt: false` sends the whole batch). |
-| `move` | Step or run in a compass direction (`n s e w ne nw se sw`), with an optional `count`. Like `send_keys`, a `count` stops early when HP drops. |
+| `move` | Step or run, with an optional `count`: give `direction`, a compass name (`n s e w ne nw se sw`), or `key`, the game's own movement key (`h j k l y u b n`, where `n` is south-east). Like `send_keys`, a `count` stops early when HP drops. |
 | `get_screen` | The current 80x24 screen. |
-| `get_state` | JSON: HP, stats, gold, AC/WC, dungeon level, position, turns, inventory, active effects, known spells, plus `seed`, `difficulty`, `time` left, the `deepest` levels visited, the `map`, the `monsters` and `objects` on it, the latest `messages` and, once the game is over, its `outcome`. |
+| `get_state` | JSON: HP, stats, gold, AC/WC, dungeon level, position, turns, inventory, active effects, known spells, plus `seed`, `difficulty`, `time` left, the `deepest` levels visited, the `map`, the `monsters` and `objects` on it, the latest `messages`, `attacked_by` (who hit you in the last few turns and whether the map showed them, so an invisible attacker is named) and, once the game is over, its `outcome`. |
 | `key_reference` | Command list, map legend and goal. |
 | `end_game` | Stop the current game. |
-| `explore` | Skill: explore the level until something needs a decision. Option `until` stops when a target is found. |
-| `travel_to` | Skill: walk to a `target` (name or map symbol) or to `x`, `y`. |
+| `explore` | Skill: explore the level until something needs a decision. Option `until` stops when a target is found; `ignore_monsters` walks on past monsters. |
+| `travel_to` | Skill: walk to a `target` (name or map symbol) or to `x`, `y`. Options: `ignore_monsters`, and `through_unknown` to cross cells not yet seen on the way to `x`, `y`. |
 | `take_stairs` | Skill: go to the known stairs and take them, `direction` `down` or `up`. |
 | `fight` | Skill: attack the nearest visible monster, then only what is next to you, until none is left or HP falls to `min_hp`. |
 | `flee` | Skill: step away from visible monsters until none is within `safe_distance`. |
@@ -130,7 +130,14 @@ position, HP and the monsters in view.
 
 Any walking skill also stops with `monster_appeared`, `monster_adjacent`,
 `hurt`, `level_changed`, `teleported`, `blocked`, `prompt`, `max_steps` or
-`game_over`.
+`game_over`. It stops for a monster once: when a new one shows up within
+six cells with a known way to reach you (one seen across the level, or
+sealed behind walls, is passed over), and when one first comes next to
+you, not at every step taken beside a monster that stays put. With
+`ignore_monsters` it does not stop for monsters at all, which is for
+walking past sleepers; it still goes round them and stops when HP drops.
+A skill's report lists `unseen_attackers` when something the map does not
+show hit you in the last few turns.
 
 What the skills will and will not do:
 
@@ -149,6 +156,9 @@ What the skills will and will not do:
   stop a single blow bigger than your HP.
 - They will not start while the game is asking a question, or while the
   character is blind or confused.
+- In town, where every building is there to be found, a skill that needs
+  one the player no longer knows of (after a potion of forgetfulness)
+  explores until it turns up. Elsewhere an unknown target is `not_found`.
 - `fight` is melee only, and `flee` looks one step ahead, so it can run
   into a dead end. Spells, potions and scrolls are left to the agent
   (`send_keys`).
@@ -285,7 +295,7 @@ The server asks agents to follow this loop:
 
 | Tool | What it does |
 |---|---|
-| `get_briefing` | What to read before a game; starts the campaign if there is none. |
+| `get_briefing` | What to read before a game; starts the campaign if there is none. A long briefing comes in pages: its first line says how many, and `page` asks for the next. |
 | `propose_strategy` | Put a strategy on trial: `title`, the one `change`, optional `parent`, `character_class` and `retry_reason`. |
 | `add_lesson` | Add a lesson: `text`, `evidence` (run ids), `confidence`. |
 | `retract_lesson` | Mark lesson `lesson_id` as wrong, with a `reason`. |

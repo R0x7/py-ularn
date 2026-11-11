@@ -95,8 +95,8 @@ def rebuild(run_dir, log=None):
                 "character_class": str(meta.get("character_class") or "").lower()}
         if meta.get("difficulty") is not None:
             args["difficulty"] = meta["difficulty"]
-        # Skills recorded before skills_version 2 behaved differently.
-        skills.LEGACY = (meta.get("skills_version") or 1) < 2
+        # Skills recorded before the current skills_version behaved differently.
+        skills.LEGACY = (meta.get("skills_version") or 1) < skills.VERSION
         ms.tool_new_game(args)
         want, got = compact_state(events[0]["state"]), compact_state(session.state())
         if want != got:

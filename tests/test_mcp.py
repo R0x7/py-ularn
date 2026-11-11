@@ -310,6 +310,66 @@ class DeathTest(unittest.TestCase):
         finally:
             mcp_server.SESSION = saved_session
 
+    def test_unseen_attacker_is_named(self):
+        from pyularn import dungeon, monster, player
+        s = self.session
+        self.assertEqual(s.state()["attacked_by"], [])
+        player.c[player.HP] = player.c[player.HPMAX] = 9000
+        x, y = player.playerx + 1, player.playery
+
+        def attacker(mon):
+            dungeon.mitem[x][y].mon = mon
+            dungeon.hitp[x][y] = 5000
+            dungeon.stealth[x][y] = dungeon.STEALTH_SEEN | dungeon.STEALTH_AWAKE
+            for _ in range(30):
+                s.send(".")
+                hits = [a for a in s.state()["attacked_by"] if a["turns_ago"] == 0]
+                if hits:
+                    return hits[0]
+            self.fail("it never attacked")
+
+        hit = attacker(monster.INVISIBLESTALKER)
+        self.assertEqual((hit["name"], hit["seen"]), (monster.monster[monster.INVISIBLESTALKER].name, False))
+        self.assertIn("not shown on the map", hit["note"])
+        self.assertNotIn("x", hit)                       # the screen does not say where
+        self.assertEqual(s.state()["monsters"], [])      # and the map still does not show it
+        hit = attacker(monster.JACKAL)
+        self.assertEqual((hit["name"], hit["seen"]), (monster.monster[monster.JACKAL].name, True))
+        self.assertNotIn("note", hit)
+        dungeon.mitem[x][y].mon = 0
+        for _ in range(12):
+            s.send(".")
+        self.assertEqual(s.state()["attacked_by"], [])   # old news is dropped
+
+    def test_move_by_game_key(self):
+        from pyularn import mcp_server, player
+        saved = mcp_server.SESSION
+        mcp_server.SESSION = self.session
+        try:
+            x, y = player.playerx, player.playery
+            mcp_server.tool_move({"key": "l"})
+            self.assertEqual((player.playerx, player.playery), (x + 1, y))
+            mcp_server.tool_move({"key": "h"})
+            self.assertEqual((player.playerx, player.playery), (x, y))
+            self.assertEqual(mcp_server.KEY_DIRECTIONS["n"], "se")   # the game's n, not north
+            self.assertEqual(mcp_server.DIRECTIONS[mcp_server.KEY_DIRECTIONS["n"]], "n")
+            for bad in ({"key": "l", "direction": "e"}, {"key": "x"}, {}):
+                with self.assertRaises(mcp_server.ToolError):
+                    mcp_server.tool_move(bad)
+        finally:
+            mcp_server.SESSION = saved
+
+    def test_briefing_pages(self):
+        from pyularn import mcp_server
+        text = "\n".join("line %d %s" % (i, "x" * 90) for i in range(900))
+        pages = mcp_server._pages(text)
+        self.assertGreater(len(pages), 3)
+        self.assertTrue(all(len(p) <= mcp_server.BRIEFING_PAGE for p in pages))
+        self.assertEqual("\n".join(pages), text)          # nothing lost, cut at line ends
+        self.assertEqual(mcp_server._pages("short"), ["short"])
+        long_line = "y" * (mcp_server.BRIEFING_PAGE * 2 + 5)
+        self.assertEqual("".join(mcp_server._pages(long_line)), long_line)
+
     def test_life_protection_is_not_a_death(self):
         from pyularn import monster, player, scores
         import pyularn.ularn as ularn
@@ -372,7 +432,7 @@ class RecordTest(unittest.TestCase):
             m = meta()
             self.assertEqual((m["seed"], m["character_class"], m["difficulty"]), (21, "Dwarf", 1))
             self.assertIsNone(m["outcome"])
-            self.assertEqual(m["skills_version"], 2)   # replays use the matching skill behaviour
+            self.assertEqual(m["skills_version"], 3)   # replays use the matching skill behaviour
 
             c.call("move", direction="e", count=2, thought="Stretching my legs.")
             c.call("send_keys", keys="i")

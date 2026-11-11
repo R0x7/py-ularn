@@ -83,6 +83,8 @@ CLASSES = {
     "rogue": "e", "adventurer": "f", "dwarf": "g", "rambo": "h",
 }
 CLASS_NAMES = {v: k for k, v in CLASSES.items()}
+# The game's movement keys, as short compass names.
+KEY_DIRECTIONS = {"k": "n", "j": "s", "l": "e", "h": "w", "u": "ne", "y": "nw", "n": "se", "b": "sw"}
 
 
 def parse_keys(text):
@@ -122,6 +124,13 @@ THOUGHT_SCHEMA = {
     "description": "A sentence or two on what you are doing and why, in plain words. "
                    "People watching the live view see it scroll under the game, so while "
                    "the view is on, give one with most moves, not only at milestones.",
+}
+
+IGNORE_SCHEMA = {
+    "type": "boolean",
+    "description": "Do not stop when monsters appear or come next to you (for walking past "
+                   "sleepers under stealth). The walk still goes round them and still stops "
+                   "when HP drops. Default false.",
 }
 
 STOP_SCHEMA = {
@@ -198,6 +207,7 @@ class GameSession:
         header.set_seed(seed)
         self._hook_death()
         self._hook_input()
+        self._hook_attacks()
         self.term = term_virtual.VirtualTerminal()
         self.exit_code = None
         self.error = None
@@ -282,6 +292,52 @@ class GameSession:
             self.outcome = None
 
         scores.died = died
+
+    def _hook_attacks(self):
+        """Remember who attacked the player lately, and whether the screen
+        showed them.  The game names every attacker in its messages, seen or
+        not, but a message scrolls away within a batch of keys; this keeps
+        what it said.  It tells nothing the screen did not: no position,
+        and "monster" for the name while the player is blind."""
+        from . import monster, player, skills
+
+        self.attacks = []
+        original = monster.hitplayer
+
+        def hitplayer(x, y):
+            try:
+                shown = any((m["x"], m["y"]) == (x, y) for m in skills.visible_monsters())
+            except Exception:
+                shown = True
+            original(x, y)
+            try:
+                name = monster.lastmonst or "monster"
+                self.attacks.append({"name": name, "turn": player.gtime, "seen": shown})
+                del self.attacks[:-20]
+            except Exception:  # never let bookkeeping break the game
+                traceback.print_exc(file=sys.stderr)
+
+        monster.hitplayer = hitplayer
+
+    def recent_attacks(self, turns=10):
+        """Attackers of the last few turns, one entry per monster name and
+        whether it was seen, latest first."""
+        from . import player
+
+        out, done = [], set()
+        for a in reversed(getattr(self, "attacks", [])):
+            if player.gtime - a["turn"] > turns:
+                break
+            key = (a["name"], a["seen"])
+            if key in done:
+                continue
+            done.add(key)
+            entry = {"name": a["name"], "turns_ago": player.gtime - a["turn"], "seen": a["seen"]}
+            if not a["seen"]:
+                entry["note"] = ("not shown on the map: it is invisible or you could not see "
+                                 "it, and it is next to you or was")
+            out.append(entry)
+        return out
 
     def _hook_input(self):
         """Keep track of what kind of input the game is blocked on: a command
@@ -562,6 +618,7 @@ class GameSession:
             if c[idx]:
                 effects.append(name)
         st["effects"] = effects
+        st["attacked_by"] = self.recent_attacks()
 
         st["known_spells"] = [
             "%s (%s)" % (spell.spelcode[i], spell.spelname[i].strip())
@@ -834,9 +891,19 @@ def tool_send_keys(args):
 
 
 def tool_move(args):
-    d = str(args.get("direction", "")).strip().lower()
+    d = str(args.get("direction") or "").strip().lower()
+    game_key = str(args.get("key") or "").strip().lower()
+    if game_key:
+        # The game's own movement key.  "n" is south-east there and north as
+        # a direction, which is why the two are separate arguments.
+        if d:
+            raise ToolError("give direction or key, not both")
+        if game_key not in KEY_DIRECTIONS:
+            raise ToolError("key must be one of: h j k l y u b n")
+        d = KEY_DIRECTIONS[game_key]
     if d not in DIRECTIONS:
-        raise ToolError("direction must be one of: " + ", ".join(sorted(DIRECTIONS)))
+        raise ToolError("direction must be one of: " + ", ".join(sorted(DIRECTIONS))
+                        + " (or give key: h j k l y u b n)")
     key = DIRECTIONS[d]
     if args.get("run"):
         key = key.upper()
@@ -963,8 +1030,42 @@ def _learn(fn):
         raise ToolError(str(e))
 
 
+BRIEFING_PAGE = 18000   # characters: a whole briefing can outgrow one tool result
+
+
+def _pages(text, size=BRIEFING_PAGE):
+    """Split text into pages of at most `size` characters, at line ends."""
+    pages, lines, length = [], [], 0
+    for line in text.split("\n"):
+        while len(line) > size:          # a single huge line: cut it
+            if lines:
+                pages.append("\n".join(lines))
+                lines, length = [], 0
+            pages.append(line[:size])
+            line = line[size:]
+        if lines and length + len(line) + 1 > size:
+            pages.append("\n".join(lines))
+            lines, length = [], 0
+        lines.append(line)
+        length += len(line) + 1
+    if lines:
+        pages.append("\n".join(lines))
+    return pages or [""]
+
+
 def tool_get_briefing(args):
-    return _learn(lambda learn, root: learn.briefing(root))
+    pages = _pages(_learn(lambda learn, root: learn.briefing(root)))
+    page = _int_arg(args, "page", 1, 1, 1000)
+    if page > len(pages):
+        raise ToolError("the briefing has %d page%s" % (len(pages), "" if len(pages) == 1 else "s"))
+    if len(pages) == 1:
+        return pages[0]
+    head = "[Briefing, page %d of %d." % (page, len(pages))
+    if page < len(pages):
+        head += " Read every page before you play: next, get_briefing with page=%d.]" % (page + 1)
+    else:
+        head += " This is the last page.]"
+    return head + "\n\n" + pages[page - 1]
 
 
 def tool_propose_strategy(args):
@@ -1044,6 +1145,13 @@ def _int_arg(args, name, default, low, high):
     return value
 
 
+def _bool_arg(args, name):
+    value = args.get(name, False)
+    if not isinstance(value, bool):
+        raise ToolError("%s must be true or false" % name)
+    return value
+
+
 def _skill_tool(name, label, run):
     """Make the handler of a skill tool.  `label(args)` is the short text
     for the live view; `run(skills, args)` calls the skill."""
@@ -1060,6 +1168,10 @@ def _skill_tool(name, label, run):
             report = run(skills, args)
         except skills.SkillError as e:
             raise ToolError(str(e))
+        if not SESSION.term.finished and SESSION.term.is_waiting():
+            unseen = [a for a in SESSION.recent_attacks(turns=3) if not a["seen"]]
+            if unseen:
+                report["unseen_attackers"] = unseen
         logged = {k: v for k, v in args.items() if k not in ("thought", "include_state")}
         SESSION.record_action(name, logged, args.get("thought"), result=report)
         return _result(include_state=bool(args.get("include_state", False)),
@@ -1076,7 +1188,9 @@ def _travel(skills, args):
         x = _int_arg(args, "x", None, 0, 66)
         y = _int_arg(args, "y", None, 0, 16)
     return skills.travel_to(SESSION, target=target, x=x, y=y,
-                            max_steps=_int_arg(args, "max_steps", 300, 1, 2000))
+                            max_steps=_int_arg(args, "max_steps", 300, 1, 2000),
+                            ignore_monsters=_bool_arg(args, "ignore_monsters"),
+                            through_unknown=_bool_arg(args, "through_unknown"))
 
 
 def _fight(skills, args):
@@ -1090,7 +1204,8 @@ def _fight(skills, args):
 tool_explore = _skill_tool(
     "explore", lambda a: "explore" + (" until %s" % a["until"] if a.get("until") else ""),
     lambda skills, a: skills.explore(SESSION, max_steps=_int_arg(a, "max_steps", 300, 1, 2000),
-                                     until=a.get("until")))
+                                     until=a.get("until"),
+                                     ignore_monsters=_bool_arg(a, "ignore_monsters")))
 tool_travel_to = _skill_tool(
     "travel_to", lambda a: "travel to %s" % (a.get("target") or "%s,%s" % (a.get("x"), a.get("y"))),
     _travel)
@@ -1098,7 +1213,8 @@ tool_take_stairs = _skill_tool(
     "take_stairs", lambda a: "take the stairs %s" % a.get("direction", "down"),
     lambda skills, a: skills.take_stairs(SESSION, direction=str(a.get("direction", "down")),
                                          volcano=bool(a.get("volcano", False)),
-                                         max_steps=_int_arg(a, "max_steps", 300, 1, 2000)))
+                                         max_steps=_int_arg(a, "max_steps", 300, 1, 2000),
+                                         ignore_monsters=_bool_arg(a, "ignore_monsters")))
 tool_fight = _skill_tool("fight", lambda a: "fight", _fight)
 tool_flee = _skill_tool(
     "flee", lambda a: "flee",
@@ -1151,18 +1267,19 @@ TOOLS = [
     },
     {
         "name": "move",
-        "description": "Move the player one or more steps in a compass direction (or run until something interesting). Directions are compass names (n is north); to send the game's own movement keys (h j k l y u b n) use send_keys.",
+        "description": "Move the player one or more steps (or run until something interesting). Give either direction, a compass name (n is north), or key, the game's own movement key (h j k l y u b n, where n is south-east).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "direction": {"type": "string", "enum": ["n", "s", "e", "w", "ne", "nw", "se", "sw"]},
+                "key": {"type": "string", "enum": ["h", "j", "k", "l", "y", "u", "b", "n"],
+                        "description": "Instead of direction: the game's movement key (h west, j south, k north, l east, y north-west, u north-east, b south-west, n south-east)."},
                 "count": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Number of steps (default 1)."},
                 "run": {"type": "boolean", "description": "Run in that direction instead of stepping."},
                 "include_state": {"type": "boolean"},
                 "stop_when_hurt": STOP_SCHEMA,
                 "thought": THOUGHT_SCHEMA,
             },
-            "required": ["direction"],
         },
         "handler": tool_move,
     },
@@ -1174,7 +1291,7 @@ TOOLS = [
     },
     {
         "name": "get_state",
-        "description": "Return structured player state as JSON: stats, HP, gold, dungeon level, position, inventory, active effects, known spells, difficulty, seed, time left, the deepest levels visited, the map as the player knows it (17 rows of 67 characters: # wall, . explored floor, blank unexplored, otherwise the screen's symbols), the monsters shown on the map, the objects known on this level (stairs, buildings, items), the latest messages, what kind of input the game is waiting for and, once the game is over, its outcome.",
+        "description": "Return structured player state as JSON: stats, HP, gold, dungeon level, position, inventory, active effects, known spells, difficulty, seed, time left, the deepest levels visited, the map as the player knows it (17 rows of 67 characters: # wall, . explored floor, blank unexplored, otherwise the screen's symbols), the monsters shown on the map, the objects known on this level (stairs, buildings, items), the latest messages, attacked_by (who hit you in the last few turns, and whether the map showed them: an invisible attacker is named here), what kind of input the game is waiting for and, once the game is over, its outcome.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_get_state,
     },
@@ -1192,11 +1309,12 @@ TOOLS = [
     },
     {
         "name": "explore",
-        "description": "Skill: explore the current level in one call. Walks to the nearest unexplored area again and again, opening doors, picking up gold and ignoring other things it walks over. Stops and says why when the level is explored, a monster appears or comes adjacent, HP drops, the level changes, or the game asks something. The result lists what was discovered.",
+        "description": "Skill: explore the current level in one call. Walks to the nearest unexplored area again and again, opening doors, picking up gold and ignoring other things it walks over. Stops and says why when the level is explored, a monster appears nearby with a way to reach you or a new one comes adjacent, HP drops, the level changes, or the game asks something. The result lists what was discovered.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "until": {"type": "string", "description": "Stop as soon as one of these is known: a target name (stairs_down, stairs_up, potion, ...) or a map symbol such as % or !."},
+                "ignore_monsters": IGNORE_SCHEMA,
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Most steps to take (default 300)."},
                 "include_state": {"type": "boolean"},
                 "thought": THOUGHT_SCHEMA,
@@ -1213,6 +1331,8 @@ TOOLS = [
                 "target": {"type": "string", "description": "A target name or a one-character map symbol."},
                 "x": {"type": "integer", "description": "Map column, 0-66 (as in get_state's position)."},
                 "y": {"type": "integer", "description": "Map row, 0-16."},
+                "ignore_monsters": IGNORE_SCHEMA,
+                "through_unknown": {"type": "boolean", "description": "With x and y: cross cells not seen yet, feeling the way (for a map lost to a potion of forgetfulness, or a place read off a map elsewhere). Default false."},
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Most steps to take (default 300)."},
                 "include_state": {"type": "boolean"},
                 "thought": THOUGHT_SCHEMA,
@@ -1228,6 +1348,7 @@ TOOLS = [
             "properties": {
                 "direction": {"type": "string", "enum": ["down", "up"], "description": "Default down."},
                 "volcano": {"type": "boolean", "description": "In town, climb down the volcanic shaft instead of entering the dungeon."},
+                "ignore_monsters": IGNORE_SCHEMA,
                 "max_steps": {"type": "integer", "minimum": 1, "maximum": 2000},
                 "include_state": {"type": "boolean"},
                 "thought": THOUGHT_SCHEMA,
@@ -1237,7 +1358,7 @@ TOOLS = [
     },
     {
         "name": "fight",
-        "description": "Skill: attack the nearest visible monster, walking up to it if needed, and keep going until no monster is within reach. Stops with low_hp when HP falls to min_hp of the maximum, so you can flee, heal or cast instead. Melee only: it does not cast spells or use items.",
+        "description": "Skill: attack the nearest visible monster, walking up to it if needed, then go on only against monsters already next to you (it never walks off after a new target). Stops with low_hp when HP falls to min_hp of the maximum or to no more than the biggest blow taken so far, and with hurt_at_range when hurt with nothing visible next to you, so you can flee, heal or cast instead. Melee only: it does not cast spells or use items.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1312,8 +1433,9 @@ TOOLS = [
     },
     {
         "name": "get_briefing",
-        "description": "Read this before each game of a learning campaign. It names the strategy to play next and what it tests, lists the playbook's lessons, shows every strategy tried with how far each got, summarises the latest games, and sets out the steps of one cycle. Needs the server's --record option.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "Read this before each game of a learning campaign. It names the strategy to play next and what it tests, lists the playbook's lessons, shows every strategy tried with how far each got, summarises the latest games, and sets out the steps of one cycle. A long briefing comes in pages: the first line says how many, and page asks for the next. Needs the server's --record option.",
+        "inputSchema": {"type": "object", "properties": {
+            "page": {"type": "integer", "minimum": 1, "description": "Which page to return (default 1)."}}},
         "handler": tool_get_briefing,
     },
     {

@@ -299,6 +299,98 @@ class SkillsTest(unittest.TestCase):
         d.item[cells[2][0]][cells[2][1]] = d.know[cells[2][0]][cells[2][1]] = itm.OELEVATORUP
         self.assertIsNone(sk.step_cost(*cells[2]))
 
+    def test_walks_stop_only_for_monsters_that_matter(self):
+        sk, s, itm, d, monster = self.skills, self.s, self.E.itm, self.E.dungeon, self.E.monster
+        self.toughen()
+        self.E.player.c[self.E.player.HOLDMONST] = 100000      # nothing moves
+        cells = self.free_cells_east(4)
+        x, y = self.pos()
+
+        # One seen far across the map (a detection potion, say) is no reason to stop.
+        far = (x - 20, y)
+        self.assertEqual(sk.seen(*far), itm.ONOTHING)
+        watch = sk.Watch(sk.Runner(s))
+        self.put_monster(far, monster.JACKAL, hp=500)
+        self.assertIsNone(watch.reason())
+        # One that is near with a way to you is.
+        self.put_monster(cells[3], monster.JACKAL, hp=500)
+        self.assertEqual(watch.reason(), "monster_appeared")
+        self.assertIsNone(watch.reason())                       # ...once
+        d.mitem[cells[3][0]][cells[3][1]].mon = 0
+        d.mitem[far[0]][far[1]].mon = 0
+
+        # One sealed behind walls, three cells off, is left out too.
+        box = cells[2]
+        for dx, dy in sk.STEPS:
+            d.item[box[0] + dx][box[1] + dy] = d.know[box[0] + dx][box[1] + dy] = itm.OWALL
+        watch = sk.Watch(sk.Runner(s))
+        self.put_monster(box, monster.JACKAL, hp=500)
+        self.assertIsNone(watch.reason())
+        d.mitem[box[0]][box[1]].mon = 0
+        for dx, dy in sk.STEPS:
+            d.item[box[0] + dx][box[1] + dy] = d.know[box[0] + dx][box[1] + dy] = itm.ONOTHING
+
+        # Walking past a monster that stays put stops once, when it first
+        # comes next to you, and not again at every step beside it.
+        self.put_monster((cells[1][0], y - 1), monster.JACKAL, hp=500)
+        r = sk.travel_to(s, x=cells[3][0], y=y)
+        self.assertIn(r["result"], ("monster_appeared", "monster_adjacent"), r)
+        results = [r["result"]]
+        for _ in range(6):
+            if self.pos() == cells[3]:
+                break
+            results.append(sk.travel_to(s, x=cells[3][0], y=y)["result"])
+        self.assertEqual(self.pos(), cells[3], results)
+        self.assertEqual(results.count("monster_adjacent"), 1, results)
+        self.assertLessEqual(len(results), 3, results)
+
+        # ...and not at all when told to ignore monsters.
+        r = sk.travel_to(s, x=x, y=y, ignore_monsters=True)
+        self.assertEqual((r["result"], self.pos()), ("arrived", (x, y)), r)
+
+    def test_forgotten_map(self):
+        sk, s, itm, d = self.skills, self.s, self.E.itm, self.E.dungeon
+        x, y = self.pos()
+
+        def forget():           # what a potion of forgetfulness does
+            for i in range(d.MAXX):
+                for j in range(d.MAXY):
+                    d.know[i][j] = itm.OUNKNOWN
+
+        # A place read off the old map can be walked to through the unknown...
+        goal = self.free_cells_east(4)[3]
+        forget()
+        r = sk.travel_to(s, x=goal[0], y=goal[1])
+        self.assertEqual(r["result"], "no_path")
+        self.assertIn("through_unknown", r["reason"])
+        r = sk.travel_to(s, x=goal[0], y=goal[1], through_unknown=True)
+        self.assertEqual((r["result"], self.pos()), ("arrived", goal), r)
+
+        # ...and in town the buildings are found again by looking for them.
+        def insist(call):
+            """Call a skill again when a wandering monster interrupts it."""
+            for tries in range(1, 12):
+                self.clear_monsters()
+                r = call()
+                if r["result"] not in ("monster_adjacent", "monster_appeared", "hurt"):
+                    return r, tries
+            self.fail(r)
+
+        self.toughen()
+        forget()
+        r, tries = insist(lambda: sk.travel_to(s, target="bank"))
+        self.assertEqual(r["result"], "arrived", r)
+        if tries == 1:
+            self.assertIn("forgotten", r["note"])
+        self.assertEqual(sk.seen(*self.pos()), itm.OBANK)
+        s.send(ESC)
+        forget()
+        r, _ = insist(lambda: sk.buy(s))
+        self.assertEqual(r["result"], "listed", r)
+        forget()
+        r, _ = insist(lambda: sk.take_stairs(s, "down"))
+        self.assertEqual((r["result"], r.get("level")), ("changed_level", "1"), r)
+
     def test_flee(self):
         sk, s, monster = self.skills, self.s, self.E.monster
         self.assertEqual(sk.flee(s)["result"], "safe")       # nothing to flee from
@@ -409,6 +501,7 @@ class SkillsTest(unittest.TestCase):
                 s.send(ESC)
             elif sk.explore(s)["result"] == "explored":
                 break
+        self.clear_monsters()       # explore no longer stops for one seen far off
         state, walls = self.assert_state_shows_the_screen()
         self.assertGreater(walls, 150)
         flat = "".join(state["map"])

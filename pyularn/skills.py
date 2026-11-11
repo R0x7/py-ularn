@@ -32,9 +32,15 @@ ESC = "\x1b"
 # ask for the behaviour it was recorded with (LEGACY): version 1 crossed
 # express elevators, stayed on a trap that had just hurt, tried four times
 # to step into something unseen, and let `fight` walk off after new
-# targets until HP fell to min_hp.
-VERSION = 2
+# targets until HP fell to min_hp.  Version 2 still stopped a walk for
+# every monster in view, however far or walled off, and at every step
+# taken next to one; it did not look for a forgotten building in town.
+VERSION = 3
 LEGACY = False
+
+ALERT_DISTANCE = 6   # a walk stops for a new monster this near, if it can get to you
+COST_UNKNOWN = 4     # walking into the unexplored, when asked to
+FAR = 1 << 30
 
 # (dx, dy) -> movement key.  y grows downwards, as on the screen.
 KEYS = {(0, -1): "k", (0, 1): "j", (1, 0): "l", (-1, 0): "h",
@@ -239,13 +245,15 @@ def target_ids(target):
 
 # ====================================================================== paths
 
-def reach(start, goal=None, avoid=()):
+def reach(start, goal=None, avoid=(), through_unknown=False):
     """Cheapest walking cost from `start` to every cell a skill may enter
     (Dijkstra over the known map).  Returns (cost, came_from).
 
     `avoid` cells (monsters) are not entered.  `goal` is always enterable if
     the player knows what is there, whatever it is, so a path can end on a
-    monster or a trap the agent chose to walk onto.
+    monster or a trap the agent chose to walk onto.  With `through_unknown`
+    unexplored cells may be crossed, at a cost, on the guess that they are
+    floor: the walk plans again as each step shows more of the map.
     """
     itm = E.itm
     cost = {start: 0}
@@ -263,9 +271,15 @@ def reach(start, goal=None, avoid=()):
             if not in_bounds(*nxt):
                 continue
             if nxt == goal:
-                step = None if seen(*nxt) in (itm.OUNKNOWN, itm.OWALL) else COST_FREE
+                k = seen(*nxt)
+                if k == itm.OUNKNOWN and through_unknown:
+                    step = COST_UNKNOWN
+                else:
+                    step = None if k in (itm.OUNKNOWN, itm.OWALL) else COST_FREE
             elif nxt in avoid:
                 step = None
+            elif through_unknown and seen(*nxt) == itm.OUNKNOWN:
+                step = COST_UNKNOWN
             else:
                 step = step_cost(*nxt)
             if step is None:
@@ -408,12 +422,16 @@ class Runner:
 class Watch:
     """Notices the things that should interrupt a walk."""
 
-    def __init__(self, runner):
+    def __init__(self, runner, ignore_monsters=False):
         self.r = runner
+        self.ignore_monsters = ignore_monsters
         self.level = E.dungeon.level
         self.hp = runner.hp()
         self.pos = runner.pos()
-        self.count = len(visible_monsters())
+        mons = visible_monsters()
+        self.count = len(mons)
+        self.adjacent = _adjacent(mons)
+        self.threats = len(_threats(self.pos, mons))
 
     def reason(self):
         r = self.r
@@ -433,31 +451,66 @@ class Watch:
         mons = visible_monsters()
         count, before = len(mons), self.count
         self.count = count
-        if mons and mons[0]["distance"] <= 1:
+        if LEGACY:
+            if mons and mons[0]["distance"] <= 1:
+                return "monster_adjacent"
+            return "monster_appeared" if count > before else None
+        # Stop once for each monster that comes next to you, not at every
+        # step taken beside one that stays where it is; and only for new
+        # monsters that are near and have a known way to reach you.
+        adjacent, was_adjacent = _adjacent(mons), self.adjacent
+        threats, were = len(_threats(pos, mons)), self.threats
+        self.adjacent, self.threats = adjacent, threats
+        if self.ignore_monsters:
+            return None
+        if adjacent - was_adjacent:
             return "monster_adjacent"
-        if count > before:
+        if threats > were:
             return "monster_appeared"
         return None
 
 
+def _adjacent(mons):
+    return {(m["x"], m["y"]) for m in mons if m["distance"] <= 1}
+
+
+def _threats(pos, mons):
+    """The visible monsters a walk should stop for: within ALERT_DISTANCE,
+    with a way to the player over the known map about that long.  One seen
+    across the level or through a wall is left out."""
+    near = [m for m in mons if m["distance"] <= ALERT_DISTANCE]
+    if not near:
+        return []
+    cost, _ = reach(pos)
+    limit = 3 * ALERT_DISTANCE
+    out = []
+    for m in near:
+        # A monster stands on its own cell: look at that and the cells round it.
+        cells = [(m["x"], m["y"])] + [(m["x"] + dx, m["y"] + dy) for dx, dy in STEPS]
+        if m["distance"] <= 1 or any(cost.get(c, FAR) <= limit for c in cells):
+            out.append(m)
+    return out
+
+
 # ====================================================================== skills
 
-def _walk(r, max_steps, next_goal, arrived):
+def _walk(r, max_steps, next_goal, arrived, ignore_monsters=False, through_unknown=False):
     """Shared loop of travel_to and explore.  `next_goal()` returns the cell
     to head for, or a result string to stop with; `arrived(cell)` says
     whether reaching the cell ends the walk."""
-    watch = Watch(r)
+    watch = Watch(r, ignore_monsters)
     stuck = 0
     while r.steps < max_steps:
         goal = next_goal()
         if isinstance(goal, str):
             return goal
         start = r.pos()
-        _, came = reach(start, goal, r.monster_cells())
+        _, came = reach(start, goal, r.monster_cells(), through_unknown)
         cells = path_to(came, start, goal)
         if not cells:
             _explain_no_path(r, start, goal)
             return "no_path"
+        guess = through_unknown and seen(*cells[0]) == E.itm.OUNKNOWN
         last = cells[0] == goal and arrived(goal)
         answered = r.step(cells[0], leave_prompt=last)
         why = watch.reason()
@@ -472,6 +525,8 @@ def _walk(r, max_steps, next_goal, arrived):
         if why:
             return why
         if r.pos() == start:
+            if guess and seen(*cells[0]) != E.itm.OUNKNOWN:
+                continue    # the guess was wrong and the cell is now known: plan again
             if seen(*cells[0]) != E.itm.OCLOSEDDOOR and not LEGACY:
                 # Not a stuck door: the step was taken as an attack on
                 # something the screen does not show.  Trying again would
@@ -531,45 +586,81 @@ def nearest(ids):
     return best[1] if best else (cells[0] if cells else None)
 
 
-def travel_to(session, target=None, x=None, y=None, max_steps=300):
+def _find(r, ids, max_steps, ignore_monsters=False):
+    """The nearest known cell holding one of `ids`.  In town, where every
+    building is there to be found, a map lost to a potion of forgetfulness
+    is explored again until one turns up.  Returns (cell, None), or
+    (None, result) when the search was interrupted."""
+    goal = nearest(ids)
+    if goal is not None or LEGACY or E.dungeon.level != 0:
+        return goal, None
+    result = _explore(r, max_steps, ids, ignore_monsters)
+    if result == "found":
+        r.notes["note"] = "the map had been forgotten: explored the town to find it again"
+        return nearest(ids), None
+    return None, ("not_found" if result == "explored" else result)
+
+
+def travel_to(session, target=None, x=None, y=None, max_steps=300, ignore_monsters=False,
+              through_unknown=False):
     """Walk to a cell or to the nearest known thing of a kind.
 
-    Results: arrived, not_found, no_path, blocked, max_steps, prompt, hurt,
-    monster_adjacent, monster_appeared, level_changed, teleported, game_over.
-    On "arrived" a prompt raised by the destination is left unanswered.
+    With `ignore_monsters` the walk does not stop when monsters appear or
+    come next to you (it still goes round them, and stops when you are
+    hurt).  With `through_unknown` a walk to x, y may cross cells not yet
+    seen, feeling its way.  Results: arrived, not_found, no_path, blocked,
+    max_steps, prompt, hurt, monster_adjacent, monster_appeared,
+    level_changed, teleported, game_over.  On "arrived" a prompt raised by
+    the destination is left unanswered.
     """
     r = Runner(session)
     r.check_ready()
     if target is not None:
-        goal = nearest(target_ids(target))
+        goal, stopped = _find(r, target_ids(target), max_steps, ignore_monsters)
         if goal is None:
-            return r.report("not_found", target=target)
+            return r.report(stopped or "not_found", target=target)
     elif x is not None and y is not None:
         if not in_bounds(x, y):
             raise SkillError("(%s, %s) is off the map" % (x, y))
         goal = (x, y)
-        if seen(x, y) in (E.itm.OUNKNOWN, E.itm.OWALL):
-            return r.report("no_path", reason="that cell is a wall or has not been seen")
+        k = seen(x, y)
+        if k == E.itm.OWALL:
+            return r.report("no_path", reason="that cell is a wall")
+        if k == E.itm.OUNKNOWN and not through_unknown:
+            return r.report("no_path", reason="that cell has not been seen: explore, or pass "
+                                              "through_unknown to feel the way there")
     else:
         raise SkillError("give a target, or both x and y")
     if r.pos() == goal:
         return r.report("arrived", note="already there")
-    result = _walk(r, max_steps, lambda: goal, lambda cell: True)
+    result = _walk(r, max_steps, lambda: goal, lambda cell: True, ignore_monsters,
+                   through_unknown and target is None)
     return r.report(result, goal={"x": goal[0], "y": goal[1]})
 
 
-def explore(session, max_steps=300, until=None):
+def explore(session, max_steps=300, until=None, ignore_monsters=False):
     """Walk to the nearest unexplored part of the level, again and again.
 
     `until` is a target name or map symbol: stop with "found" as soon as one
-    is known.  Results: explored (nothing left to reach), found, plus the
-    interruptions of travel_to.  The report lists what was discovered.
+    is known.  `ignore_monsters` is as for travel_to.  Results: explored
+    (nothing left to reach), found, plus the interruptions of travel_to.
+    The report lists what was discovered.
     """
     r = Runner(session)
     r.check_ready()
     wanted = target_ids(until) if until is not None else None
     level = E.dungeon.level
     before = {(o["x"], o["y"]) for o in known_objects(10000)}
+    result = _explore(r, max_steps, wanted, ignore_monsters)
+    extra = {}
+    if not r.over() and E.dungeon.level == level:
+        extra["discovered"] = [o for o in known_objects(10000)
+                               if (o["x"], o["y"]) not in before][:30]
+    return r.report(result, **extra)
+
+
+def _explore(r, max_steps, wanted=None, ignore_monsters=False):
+    """The walk of explore: returns the result string."""
     state = {"target": None}
 
     def found():
@@ -584,17 +675,23 @@ def explore(session, max_steps=300, until=None):
         target = state["target"]
         if target is None or target not in cost or target == start or not is_frontier(*target):
             frontier = [c for c in cost if c != start and is_frontier(*c)]
+            if not frontier and not state.get("looked") and not LEGACY \
+                    and len(cost) == 1 and is_frontier(*start):
+                # Nothing at all is known, not even the cells next to you
+                # (a potion of forgetfulness): wait a turn to look around.
+                state["looked"] = True
+                r.press(".")
+                r.steps += 1
+                if not r.clear_prompts():
+                    return "prompt"
+                return next_goal()
             if not frontier:
                 return "explored"
             target = state["target"] = min(frontier, key=lambda c: (cost[c], c[1], c[0]))
         return target
 
-    result = "found" if found() else _walk(r, max_steps, next_goal, lambda cell: False)
-    extra = {}
-    if not r.over() and E.dungeon.level == level:
-        extra["discovered"] = [o for o in known_objects(10000)
-                               if (o["x"], o["y"]) not in before][:30]
-    return r.report(result, **extra)
+    return "found" if found() else _walk(r, max_steps, next_goal, lambda cell: False,
+                                         ignore_monsters)
 
 
 def _step_aside(r):
@@ -607,7 +704,7 @@ def _step_aside(r):
     return bool(side) and r.step(min(side)) and r.pos() != start
 
 
-def take_stairs(session, direction="down", volcano=False, max_steps=300):
+def take_stairs(session, direction="down", volcano=False, max_steps=300, ignore_monsters=False):
     """Go to the way down (or up) and take it.
 
     In town "down" is the dungeon entrance, or the volcanic shaft with
@@ -627,7 +724,9 @@ def take_stairs(session, direction="down", volcano=False, max_steps=300):
             ids, key = ({itm.OVOLDOWN}, "c") if volcano else ({itm.OENTRANCE}, "g")
         else:
             ids, key = {itm.OSTAIRSDOWN}, "d"
-        goal = nearest(ids)
+        goal, stopped = _find(r, ids, max_steps, ignore_monsters)
+        if stopped and stopped != "not_found":
+            return r.report(stopped)
     elif level == 0:
         raise SkillError("You are in town: there is no way up.")
     elif level == 1:
@@ -645,7 +744,7 @@ def take_stairs(session, direction="down", volcano=False, max_steps=300):
         if not _step_aside(r):
             return r.report("blocked", note="no room to step off and back onto it")
     if r.pos() != goal:
-        result = _walk(r, max_steps, lambda: goal, lambda cell: True)
+        result = _walk(r, max_steps, lambda: goal, lambda cell: True, ignore_monsters)
         if result != "arrived":
             return r.report(result)
 
