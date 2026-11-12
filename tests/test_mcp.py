@@ -498,7 +498,7 @@ class RecordTest(unittest.TestCase):
             m = meta()
             self.assertEqual((m["seed"], m["character_class"], m["difficulty"]), (21, "Dwarf", 1))
             self.assertIsNone(m["outcome"])
-            self.assertEqual(m["skills_version"], 5)   # replays use the matching skill behaviour
+            self.assertEqual(m["skills_version"], 7)   # replays use the matching skill behaviour
 
             c.call("move", direction="e", count=2, thought="Stretching my legs.")
             c.call("send_keys", keys="i")

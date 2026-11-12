@@ -138,6 +138,8 @@ class SkillsTest(unittest.TestCase):
         # Things that ask a question are passed only when there is no way round.
         costly, cells_walked = wall_of(itm.OALTAR)
         self.assertNotIn((x, y), cells_walked)
+        # An altar is never crossed: a walk could only answer it "ignore".
+        self.assertIsNone(sk.step_cost(x, y))
 
     # ------------------------------------------------------------ shopping
     def test_buy(self):

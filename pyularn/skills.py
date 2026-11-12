@@ -38,8 +38,14 @@ ESC = "\x1b"
 # taken next to one; it did not look for a forgotten building in town.
 # Version 3 had `flee` look one step ahead only.  Version 4 took "In What
 # Direction?" for the map waiting for a command, so a skill started there
-# answered the question with its first key.
-VERSION = 5
+# answered the question with its first key.  Version 5 walked over altars
+# and answered their prompt "ignore", which can summon a monster and add
+# Aggravate; version 6 routes round known altars and stops on one it finds
+# underfoot, leaving the prompt to the agent.  Version 6 opened closed
+# doors in the volcano, where a failed try can add Aggravate, which
+# overrides stealth; version 7 routes round them there and leaves a door
+# it is asked to cross to the agent.
+VERSION = 7
 BEHAVE = VERSION     # the version whose behaviour is in force; see behave_as
 LEGACY = False       # behaving as a version before 3
 
@@ -97,10 +103,15 @@ def hidden_ids():
 
 
 def hazard_ids():
-    """Known things a walk must not cross: traps, and express elevators,
-    which carry you off as soon as you step on them."""
+    """Known things a walk must not cross: traps, express elevators, which
+    carry you off as soon as you step on them, and altars, whose prompt a
+    walk could only answer "ignore" (a monster and Aggravate 30% of the time)."""
     traps = ("OPIT", "OTELEPORTER", "OTRAPARROW", "ODARTRAP", "OTRAPDOOR", "OANNIHILATION")
-    return _ids(*traps) if LEGACY else _ids(*traps, "OELEVATORUP", "OELEVATORDOWN")
+    if LEGACY:
+        return _ids(*traps)
+    if BEHAVE < 6:
+        return _ids(*traps, "OELEVATORUP", "OELEVATORDOWN")
+    return _ids(*traps, "OELEVATORUP", "OELEVATORDOWN", "OALTAR")
 
 
 def trap_ids():
@@ -154,6 +165,12 @@ def in_bounds(x, y):
     return 0 <= x < E.dungeon.MAXX and 0 <= y < E.dungeon.MAXY
 
 
+def in_volcano():
+    """On a volcano level, where skills (version 7 on) leave closed doors
+    alone: a failed try can add Aggravate, which wakes everything."""
+    return BEHAVE >= 7 and E.dungeon.level > E.dungeon.DBOTTOM
+
+
 def step_cost(x, y):
     """Cost of walking onto (x, y), or None if a skill will not go there."""
     itm = E.itm
@@ -163,7 +180,7 @@ def step_cost(x, y):
     if k in (itm.ONOTHING, itm.OOPENDOOR) or k in gold_ids():
         return COST_FREE
     if k == itm.OCLOSEDDOOR:
-        return COST_DOOR
+        return None if in_volcano() else COST_DOOR
     return COST_OBJECT
 
 
@@ -417,6 +434,10 @@ class Runner:
         w = self.s.waiting
         return (w.get("answers") or "") if w else ""
 
+    def on_altar(self):
+        x, y = self.pos()
+        return E.dungeon.item[x][y] == E.itm.OALTAR
+
     def monster_cells(self):
         return {(m["x"], m["y"]) for m in visible_monsters()}
 
@@ -466,7 +487,11 @@ class Runner:
                 return True
             if kind != "prompt":
                 return False
+            if BEHAVE >= 6 and self.on_altar():
+                return False    # pray or ignore is the agent's call, not a walk's
             answers = self.answers()
+            if answers == DOOR_PROMPT and in_volcano():
+                return False    # opening may add Aggravate: the agent's call
             if answers == DOOR_PROMPT:
                 self.press("o")
             elif answers == " ":      # "press space to continue"
