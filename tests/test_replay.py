@@ -102,6 +102,8 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual([d[1:] for d in decoded][-1], want[-1][1:])
         for got in decoded:
             self.assertIn(got, want)
+        # The page shows the difficulty beside the level and the turn.
+        self.assertEqual(decoded[0][3]["difficulty"], 0)
 
     def test_export_writes_a_site(self):
         run = self.record_game()

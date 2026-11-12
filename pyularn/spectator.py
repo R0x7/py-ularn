@@ -576,7 +576,8 @@ function render(f, redraw) {
   const s = f.state;
   if (s) {
     const st = s.stats;
-    $("where").textContent = `Level ${s.dungeon_level} · turn ${s.turns} · ${s.rank}`;
+    const diff = s.difficulty != null ? ` · difficulty ${s.difficulty}` : "";
+    $("where").textContent = `Level ${s.dungeon_level} · turn ${s.turns}${diff} · ${s.rank}`;
     $("hp").textContent = `${st.hp} / ${st.hp_max}`;
     const hpPct = st.hp_max ? Math.max(0, Math.min(100, 100 * st.hp / st.hp_max)) : 0;
     $("hpbar").style.width = hpPct + "%";
