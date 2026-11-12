@@ -34,7 +34,7 @@ import tempfile
 from .recorder import compact_state
 
 # The parts of the full state the page shows.
-PAGE_STATE = ("dungeon_level", "turns", "rank", "stats", "inventory",
+PAGE_STATE = ("dungeon_level", "turns", "difficulty", "rank", "stats", "inventory",
               "effects", "known_spells")
 PLAYER_NAME = "Agent"
 
@@ -301,7 +301,9 @@ async function fetchJson(url) {
   const text = await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).text();
   return JSON.parse(text);
 }
-function decode(entries) {
+function decode(entries, run) {
+  // Replays made before the state carried the difficulty take the run's.
+  const difficulty = run && run.difficulty != null ? run.difficulty : null;
   const out = [];
   let rows = [], map = null, state = null;
   for (const e of entries) {
@@ -321,7 +323,7 @@ function decode(entries) {
     if (e.s) {
       // The first state is whole; later ones carry only what changed.
       const { st, ...rest } = e.s;
-      state = state ? { ...state, ...rest } : rest;
+      state = state ? { ...state, ...rest } : { difficulty, ...rest };
       if (st) state.stats = { ...state.stats, ...st };
     }
     out.push({ game: 1, key: e.k || null, status: e.over ? "game over" : "playing",
@@ -404,7 +406,7 @@ async function route() {
   $("conn").textContent = "loading"; $("conn").className = "pill";
   try {
     const data = await fetchJson("runs/" + encodeURIComponent(id) + ".json.gz");
-    frames = decode(data.msgs);
+    frames = decode(data.msgs, data.run);
   } catch (e) {
     $("conn").textContent = "could not load this game";
     return;
