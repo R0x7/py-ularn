@@ -327,6 +327,56 @@ class SkillsTest(unittest.TestCase):
         d.item[cells[2][0]][cells[2][1]] = d.know[cells[2][0]][cells[2][1]] = itm.OELEVATORUP
         self.assertIsNone(sk.step_cost(*cells[2]))
 
+    def test_walks_stop_when_protection_ends_or_something_attacks(self):
+        sk, s, d, p, monster = self.skills, self.s, self.E.dungeon, self.E.player, self.E.monster
+        self.toughen()
+
+        # get_state says how long each effect has left.
+        p.c[p.STEALTH] = 40
+        self.assertEqual(s.state()["effect_turns"]["Stealth"], 40)
+        p.c[p.STEALTH] = sk.PERMANENT
+        self.assertEqual(s.state()["effect_turns"]["Stealth"], "permanent")
+
+        # Stealth running out stops a walk, even one ignoring monsters.
+        cells = self.free_cells_east(4)
+        p.c[p.STEALTH] = 2
+        r = sk.travel_to(s, x=cells[3][0], y=cells[3][1], ignore_monsters=True)
+        self.assertEqual((r["result"], r["effects_ended"]), ("effect_ended", ["Stealth"]), r)
+        self.assertLess(r["steps"], 4)
+        p.c[p.HOLDMONST] = 3
+        r = sk.rest(s, turns=10, ignore_monsters=True)
+        self.assertEqual((r["result"], r["effects_ended"]), ("effect_ended", ["Hold Monst"]), r)
+
+        # An unseen monster that attacks and misses stops it too.
+        p.c[p.AC] = 1000                                    # every blow misses
+        x, y = self.pos()
+        self.put_monster((x, y + 1), monster.INVISIBLESTALKER, awake=True, hp=5000)
+        r = sk.rest(s, turns=30, ignore_monsters=True)
+        name = monster.monster[monster.INVISIBLESTALKER].name
+        self.assertEqual((r["result"], r["attacked_by"]),
+                         ("attacked", [{"name": name, "seen": False}]), r)
+        self.assertEqual(p.c[p.HP], 9000)
+        # Once you know it is there, it does not stop the next call...
+        r = sk.rest(s, turns=5, ignore_monsters=True)
+        self.assertEqual(r["result"], "waited", r)
+        d.mitem[x][y + 1].mon = 0
+        for _ in range(4):
+            s.send(".")
+        # ...nor does a monster that was next to you as the walk began.
+        self.put_monster((x, y + 1), monster.JACKAL, awake=True, hp=5000)
+        r = sk.rest(s, turns=8, ignore_monsters=True)
+        self.assertEqual(r["result"], "waited", r)
+        d.mitem[x][y + 1].mon = 0
+
+        # Replays of older runs keep the old behaviour.
+        sk.behave_as(7)
+        try:
+            p.c[p.STEALTH] = 2
+            r = sk.rest(s, turns=4)
+            self.assertEqual(r["result"], "waited", r)
+        finally:
+            sk.behave_as()
+
     def test_walks_stop_only_for_monsters_that_matter(self):
         sk, s, itm, d, monster = self.skills, self.s, self.E.itm, self.E.dungeon, self.E.monster
         self.toughen()

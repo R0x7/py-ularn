@@ -131,7 +131,9 @@ IGNORE_SCHEMA = {
     "type": "boolean",
     "description": "Do not stop when monsters appear or come next to you (for walking past "
                    "sleepers under stealth). The walk still goes round them and still stops "
-                   "when HP drops. Default false.",
+                   "when HP drops, when a timed effect such as Stealth or Hold Monst runs out "
+                   "(effect_ended), and when a monster that was not already next to you or "
+                   "attacking you attacks, hit or miss (attacked). Default false.",
 }
 
 STOP_SCHEMA = {
@@ -309,6 +311,7 @@ class GameSession:
         from . import dungeon, monster, player, skills
 
         self.attacks = []
+        self.attack_count = 0   # every attack ever kept, for skills to see new ones
         original = monster.hitplayer
 
         def hitplayer(x, y):
@@ -324,6 +327,7 @@ class GameSession:
             try:
                 name = monster.lastmonst or "monster"
                 self.attacks.append({"name": name, "turn": player.gtime, "seen": shown})
+                self.attack_count += 1
                 del self.attacks[:-20]
             except Exception:  # never let bookkeeping break the game
                 traceback.print_exc(file=sys.stderr)
@@ -646,6 +650,7 @@ class GameSession:
         st["inventory"] = inv
 
         st["effects"] = skills.active_effects()
+        st["effect_turns"] = skills.effect_turns()
         st["attacked_by"] = self.recent_attacks()
 
         st["known_spells"] = [
@@ -1461,7 +1466,7 @@ TOOLS = [
     },
     {
         "name": "get_state",
-        "description": "Return structured player state as JSON: stats, HP, gold, dungeon level, position, inventory, active effects, known spells, difficulty, seed, time left, the deepest levels visited, the map as the player knows it (17 rows of 67 characters: # wall, . explored floor, blank unexplored, otherwise the screen's symbols), the monsters shown on the map, the objects known on this level (stairs, buildings, items), the latest messages, attacked_by (who hit you in the last few turns, and whether the map showed them: an invisible attacker is named here), what kind of input the game is waiting for and, once the game is over, its outcome.",
+        "description": "Return structured player state as JSON: stats, HP, gold, dungeon level, position, inventory, active effects and effect_turns (the turns each has left, or permanent), known spells, difficulty, seed, time left, the deepest levels visited, the map as the player knows it (17 rows of 67 characters: # wall, . explored floor, blank unexplored, otherwise the screen's symbols), the monsters shown on the map, the objects known on this level (stairs, buildings, items), the latest messages, attacked_by (who hit you in the last few turns, and whether the map showed them: an invisible attacker is named here), what kind of input the game is waiting for and, once the game is over, its outcome.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_get_state,
     },
@@ -1479,7 +1484,7 @@ TOOLS = [
     },
     {
         "name": "explore",
-        "description": "Skill: explore the current level in one call. Walks to the nearest unexplored area again and again, opening doors, picking up gold and ignoring other things it walks over (pick_up fetches them). Stops and says why when the level is explored, a monster appears nearby with a way to reach you or a new one comes adjacent, HP drops, the level changes, or the game asks something. The result lists what was discovered. explored means nothing is left that a skill can walk to: beyond lists known traps with more of the level past them. no_path means more is left but monsters (blocked_by) stand in the only known way.",
+        "description": "Skill: explore the current level in one call. Walks to the nearest unexplored area again and again, opening doors, picking up gold and ignoring other things it walks over (pick_up fetches them). Stops and says why when the level is explored, a monster appears nearby with a way to reach you or a new one comes adjacent, HP drops, a monster attacks (attacked, even a miss), a timed effect such as Stealth runs out (effect_ended), the level changes, or the game asks something. The result lists what was discovered. explored means nothing is left that a skill can walk to: beyond lists known traps with more of the level past them. no_path means more is left but monsters (blocked_by) stand in the only known way.",
         "inputSchema": {
             "type": "object",
             "properties": {

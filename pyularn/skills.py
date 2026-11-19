@@ -44,8 +44,11 @@ ESC = "\x1b"
 # underfoot, leaving the prompt to the agent.  Version 6 opened closed
 # doors in the volcano, where a failed try can add Aggravate, which
 # overrides stealth; version 7 routes round them there and leaves a door
-# it is asked to cross to the agent.
-VERSION = 7
+# it is asked to cross to the agent.  Version 7 walked and rested on, even
+# with ignore_monsters, when a timed effect such as Stealth or Hold ran out
+# and when a monster attacked without doing damage; version 8 stops for
+# both (effect_ended, attacked).
+VERSION = 8
 BEHAVE = VERSION     # the version whose behaviour is in force; see behave_as
 LEGACY = False       # behaving as a version before 3
 
@@ -528,6 +531,45 @@ class Watch:
         self.count = len(mons)
         self.adjacent = _adjacent(mons)
         self.threats = len(_threats(self.pos, mons))
+        # The timed effects running now, which a walk stops for when they
+        # run out, and the attacks already counted.  Whatever is next to
+        # you or attacking you as the walk begins is expected to go on
+        # attacking: only a new attacker stops it, so a walk away from a
+        # chaser with ignore_monsters is not stopped at every step.
+        c = E.player.c
+        self.effects = {idx: name for idx, name in _listed_effects() if c[idx]}
+        self.attack_count = getattr(runner.s, "attack_count", 0)
+        turn = E.player.gtime
+        self.expected = {m["name"] for m in mons if m["distance"] <= 1}
+        self.expected |= {a["name"] for a in getattr(runner.s, "attacks", ())
+                          if turn - a["turn"] <= 2}
+
+    def _effects_ended(self):
+        c = E.player.c
+        ended = [name for idx, name in self.effects.items() if not c[idx]]
+        if not ended:
+            return None
+        self.effects = {idx: name for idx, name in self.effects.items() if c[idx]}
+        self.r.notes["effects_ended"] = ended
+        return "effect_ended"
+
+    def _attacked(self):
+        count = getattr(self.r.s, "attack_count", 0)
+        new, self.attack_count = count - self.attack_count, count
+        if new <= 0:
+            return None
+        attacks = list(getattr(self.r.s, "attacks", ()))[-new:]
+        fresh = [a for a in attacks if a["name"] not in self.expected]
+        self.expected |= {a["name"] for a in attacks}
+        if not fresh:
+            return None
+        by = []
+        for a in fresh:
+            entry = {"name": a["name"], "seen": a["seen"]}
+            if entry not in by:
+                by.append(entry)
+        self.r.notes["attacked_by"] = by
+        return "attacked"
 
     def reason(self):
         r = self.r
@@ -557,6 +599,10 @@ class Watch:
         adjacent, was_adjacent = _adjacent(mons), self.adjacent
         threats, were = len(_threats(pos, mons)), self.threats
         self.adjacent, self.threats = adjacent, threats
+        if BEHAVE >= 8:
+            why = self._effects_ended() or self._attacked()
+            if why:
+                return why
         if self.ignore_monsters:
             return None
         if adjacent - was_adjacent:
@@ -618,10 +664,15 @@ def _walk(r, max_steps, next_goal, arrived, ignore_monsters=False, through_unkno
             _off_trap(r)
         if not answered:
             return "prompt"
-        if why:
+        if why and why != "effect_ended":
             return why
+        # An effect that ran out is reported, but a step that went nowhere
+        # says more: hitting something unseen ends Hold Monst, and "blocked"
+        # tells why (effects_ended is still in the report).
         if r.pos() == start:
             if guess and seen(*cells[0]) != E.itm.OUNKNOWN:
+                if why:
+                    return why
                 continue    # the guess was wrong and the cell is now known: plan again
             if seen(*cells[0]) != E.itm.OCLOSEDDOOR and not LEGACY:
                 # Not a stuck door: the step was taken as an attack on
@@ -637,6 +688,8 @@ def _walk(r, max_steps, next_goal, arrived, ignore_monsters=False, through_unkno
                 return "blocked"
         else:
             stuck = 0
+        if why:
+            return why
     return "max_steps"
 
 
@@ -742,10 +795,14 @@ def travel_to(session, target=None, x=None, y=None, max_steps=300, ignore_monste
 
     With `ignore_monsters` the walk does not stop when monsters appear or
     come next to you (it still goes round them, and stops when you are
-    hurt).  With `through_unknown` a walk to x, y may cross cells not yet
-    seen, feeling its way.  Results: arrived, not_found, no_path, blocked,
-    max_steps, prompt, hurt, monster_adjacent, monster_appeared,
-    level_changed, teleported, game_over.  On "arrived" a prompt raised by
+    hurt).  Either way it stops when a timed effect that was running as it
+    began (Stealth, Hold Monst...) runs out, and when a monster attacks you,
+    hit or miss, unless that monster was next to you or attacking you as the
+    walk began.  With `through_unknown` a walk to x, y may cross cells not
+    yet seen, feeling its way.  Results: arrived, not_found, no_path,
+    blocked, max_steps, prompt, hurt, effect_ended (effects_ended names
+    them), attacked (attacked_by names who), monster_adjacent,
+    monster_appeared, level_changed, teleported, game_over.  On "arrived" a prompt raised by
     the destination is left unanswered.
     """
     r = Runner(session)
@@ -1068,17 +1125,33 @@ UNLISTED_EFFECTS = (
 )
 
 
+def _listed_effects():
+    """(player.c[] index, name) of the timed effects the game lists beside
+    the map, under the names it uses there."""
+    return [(e.typ, e.string.strip()) for e in E.ularn_win._get_bot_data()]
+
+
 def _effects():
     """(player.c[] index, name) of every timed effect: those the game lists
     beside the map, under the names it uses there, then the unlisted ones."""
-    listed = [(e.typ, e.string.strip()) for e in E.ularn_win._get_bot_data()]
-    return listed + [(getattr(E.player, n), name) for n, name in UNLISTED_EFFECTS]
+    return _listed_effects() + [(getattr(E.player, n), name) for n, name in UNLISTED_EFFECTS]
 
 
 def active_effects():
     """Names of the timed effects now running."""
     c = E.player.c
     return [name for idx, name in _effects() if c[idx]]
+
+
+PERMANENT = 99999   # what the game sets an effect to when it never runs out
+
+
+def effect_turns():
+    """The turns left of each timed effect now running, by name, or
+    "permanent" for one that never runs out."""
+    c = E.player.c
+    return {name: ("permanent" if c[idx] >= PERMANENT else c[idx])
+            for idx, name in _effects() if c[idx]}
 
 
 def _pack_has_room():
