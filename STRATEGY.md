@@ -17,6 +17,8 @@ Here is where the 13 ladder games at d2-d3 were lost. Each cause now has a rule 
 - The climb home with the cure: 3 games. Chained Z into rock, an unscouted route, an invisible prince met under Aggravate.
 - Volcano below V1 without the kit: 2 games. A trap door on V5, two dragons on V2.
 
+A later batch of 5 games at d0 (Rogue, seeds 1001-1005) won none, though all five reached the volcano at CL16-19 with the lance and AC 30-45. An **invisible demon prince** killed or blocked every one: three deaths (V1, V2, and V4 while carrying the cure) and two games stopped on V2 and V5 with the route home plugged. Section 7 now has the rules this taught.
+
 The rules that matter most are marked **MUST**.
 
 ---
@@ -61,7 +63,7 @@ Play a Rogue. Survive DL1 on missiles and lemmings, and sell the first finds for
   - Farm in an open room, never in a corridor (lemmings plug it permanently) and never near the stairs (they follow you into town, and shops won't open while a monster is adjacent).
   - One magic missile kills a whole line of them without breeding.
 - **Giant ants and centipedes** drain STR permanently. Kill them at range. A potion of strength resets STR to 12.
-- **Rust monsters** (DL3+ at d3) and **gelatinous cubes** dull your weapon and armour. Use missiles, or walk away.
+- **Rust monsters** (DL3+ at d3), **disenchantresses** and **gelatinous cubes** dull your weapon each time you hit them: any weapon with a plus above 0 (a sword of slashing or sunsword too) loses 1. Rust monsters took a sunsword from +4 to +2 during one prayer session. Kill them with missiles or cone of cold, or unwield first, or walk away.
 - **Nymphs** steal carried items, but not worn or wielded ones; AC 15+ makes them miss. **Leprechauns** steal gold: bank it before DL3+.
 - **White dragons** can appear by DL3-6: leave the level. **Wraiths and vampires** drain levels: leave the level, or read undead protection.
 - **Arrow and dart traps** hit you every turn you stand on them. After a "hurt" result, step off before resting.
@@ -82,7 +84,9 @@ Play a Rogue. Survive DL1 on missiles and lemmings, and sell the first finds for
   - 1 in 8: worn armour or shield +2;
   - often: +3 AC for 800 turns.
 - Armour stops at +9 and is never destroyed. A wielded item past +9 still gains about 2.4% per prayer.
-- Never pray free (`j`) at d3+: it brings centipedes and rust monsters. Never answer "ignore", and never press Esc (that also counts as ignore).
+- Never pray free (`j`) at d3+: it brings centipedes and rust monsters. Never answer "ignore", and never press Esc (that also counts as ignore): it summons a monster 30% of the time and adds up to 450 turns of Aggravate. The prompt takes only `p`, `d`, `i` or Esc, so arriving with too much gold still means giving at least a tenth of it.
+- Armour blessings pick the shield or the body armour at random. Once the shield is +9, take it off, so every blessing lands on the armour; take the armour off once it is +9 too.
+- End every prayer batch by stepping off the altar, so no prompt is left pending for the next call.
 
 **MUST: the altar invariant (two games died from breaking it)**
 1. Keep spare gold in piles 4+ squares from the altar.
@@ -109,7 +113,7 @@ Play a Rogue. Survive DL1 on missiles and lemmings, and sell the first finds for
 
 ## 5. Shopping and the gate before the volcano
 
-**The DND store never restocks.** Per game at d3 it holds 1 raise level, 2 stealth, 2 hold monsters, 2 teleport, 2 time warp, 1 heroism, 4 enlightenment and 2 magic mapping. Buy all the volcano consumables in your first big purchase.
+**The DND store never restocks.** A trip back to town for more stealth or hold monsters finds the shelf empty, so don't plan one. Per game at d3 it holds 1 raise level, 2 stealth, 2 hold monsters, 2 teleport, 2 time warp, 1 heroism, 4 enlightenment and 2 magic mapping. Buy all the volcano consumables in your first big purchase.
 
 **Buy:**
 - lance of death (200k): every hit does 10,000 to non-demons;
@@ -123,6 +127,8 @@ Play a Rogue. Survive DL1 on missiles and lemmings, and sell the first finds for
 - heroism;
 - aggravate monsters (for the Lucifer lure);
 - identify, before reading anything you found.
+
+**Sell gems at the bank,** never at the trading post: the bank pays 100 × the gem's value, the post only 20 ×.
 
 **MUST: the gate.** Don't take the volcano shaft until all of these are true:
 - CL6+ (the raise level potion);
@@ -163,7 +169,9 @@ Read stealth at the top of the shaft in town. The landing square is random and c
 ## 7. Descending V2 → V5
 
 - **Volcano levels** are canned maps from `pyularn/data/Umaps` about half the time. Match the cells round you (or a magic-mapped level) against the file to get the layout, the sealed pockets and, on V5, the cure square (`!`). Stairs and items are placed at random.
-- **Use stairs where they exist** (V1→V2→V3). V3 and V4 drop by pit; lower DEX makes pits drop you (take the DEX ring off). A volcano pit fall does up to 3×level+3 damage, so cross at full HP.
+- **Use stairs where they exist** (V1→V2→V3). V3 and V4 drop by pit. A pit drops you when pack weight is above 9 × DEX − 70 (below that, only about 4% of the time), on about 80% of the steps onto it. To fall, take the DEX ring off; to cross a pit safely (a heavy pack on DL1-15 can make one impassable), put it on. A volcano pit fall does up to 3×level+3 damage, so cross at full HP.
+- **A carried wand of wonder stops every pit and trap door fall.** Drop it beside the V3/V4 pit before stepping in, and pick up another later if you can.
+- Vaporize rock and wall-crumbling spells work only on V1 and V2.
 - **Z (innate teleport, CL10+)** lands you 1 level up to 2 down. Each press has about a 1.3-2% chance of killing you in solid rock, unless wtw is running.
   - **MUST: never press Z twice in a row** to dodge something.
   - Teleport scrolls carry no rock risk.
@@ -176,6 +184,11 @@ Read stealth at the top of the shaft in town. The landing square is random and c
   - The skills (v7) route round closed volcano doors.
   - Blast doors instead: lightning, cone of cold or pulverization (40+ damage). Lightning and pulverization also crumble walls on V1/V2 (52+ damage).
   - Or open a door by hand only when no sleeper is in your 11×7 window.
+- **MUST: demons are invisible.** Demon lords, demon princes and Lucifer never show on the map unless you carry the **Eye of Larn** (`gfx.py`, `monster.py`). A potion or spell of see invisible does not help: it reveals only invisible stalkers.
+  - The Eye lies on the `~` square of DL15, which is always a canned map, under a sleeping demon prince. Under stealth with Slayer, kill the prince and take the Eye before the volcano. The bank buys the Eye for up to 250k, but keep it if you are going down.
+  - Without the Eye, the signs of a demon are: `attacked_by` in `get_state` naming an attacker the map does not show, a 30+ HP hit from nothing, "You missed the demon prince", or `travel_to` reporting a route blocked for no visible reason.
+  - On any of those signs, act at once: read hold monsters, then drink instant healing or read teleport. Never send another `travel_to`, `fight` or walk script, and never `fight` with reach above 1 to clear a "blocked" route. Two games died by making one more move after such a sign, with hold, healing and teleports still unused.
+  - Have stealth running on every volcano step, including when you come back down after a trip up. Three of the five games met their prince just after stealth ran out or was not renewed.
 - **Demons.** On V3-V5, wield Slayer while moving; the lance does only 300 to demons.
   - "D" may be a dragon or a demon prince: read the monster name in `get_state` before coming within 2 squares.
   - A demon prince did 95-193 a turn at d2.
@@ -189,8 +202,10 @@ Read stealth at the top of the shaft in town. The landing square is random and c
 - **MUST: trap doors.** V3-V5 have invisible trap doors. On V5 a trap door is an unrevivable death "to HELL", and one can lie under a monster you just killed.
   - Minimise floor steps on V5 above everything else.
   - With wtw (1 SP, 6-15 turns; recast before each wall band), travel inside wall cells and step onto floor only at the cure square and the stairs.
-  - A wand of wonder protects you completely; keep one if you find it.
+  - A wand of wonder protects you completely; keep one if you find it (you dropped yours above the V4 pit, so this means a second one).
+  - Invisible trap doors trigger on 5 steps in 17. One or two lie on each of V3-V5.
   - A teleport scroll is a good V5 opener: it lands near the target with fewer steps.
+- **Before taking the cure, check the way out.** Walk or wall-walk the route from the cure square to the V5 up stairs and clear it under stealth. Two games had the cure or stood next to it and found the only corridor to the stairs plugged by an invisible prince.
 - On arrival, read magic mapping (or match the 8 cells round you), then run the Umaps matcher to find the cure square.
 - Under stealth, lance the cure room and your route.
 - **Lucifer** (invisible, 32,767 HP, hits for 121-220 plus a level drain) sits on the potion. Make him take exactly one step, then freeze him. His step is deterministic: the first of S, E, N, W, NE, NW, SE, SW that lowers his distance to you. He walks through walls.
@@ -203,7 +218,7 @@ Read stealth at the top of the shaft in town. The landing square is random and c
     6. Probe the cure square with a spell ("There wasn't anything there!").
     7. Take the potion from a wall cell.
   - **Method B:** wait 6+ columns from him on his row until stealth ends, then step to distance 3-5. Every monster in the window moves once, so he steps off. Read hold at once, probe, and take the potion.
-  - **Method C:** from 2+ squares away inside a wall, read aggravate monsters. He steps once; hold, take the potion.
+  - **Method C:** from 2+ squares away inside a wall, read aggravate monsters. He steps once; hold, take the potion. The scroll adds 800 turns of Aggravate, which is still running for the whole climb (one game had about 1,480 turns of it left on V4): everything awake hunts you, so the hold must never break. Prefer A or B when you have the time.
   - **Never step toward him unheld,** and never wait at distance 2.
 - **Right after taking the potion:**
   - If you know permanence, cast it with hold + stealth + wtw + globe all running (check effects first: Aggravate would become permanent too). Then walk home inside walls; nothing moves unless you hit it.
@@ -217,7 +232,8 @@ Read stealth at the top of the shaft in town. The landing square is random and c
 1. With the cure, on volcano levels: no `fight`, `explore`, `travel_to`, `pick_up` or `rest`. Use single-step keys, 1-2 per call, onto squares you have checked in `get_state` (no altars, traps, unknown "D"s). Plan routes with a BFS that treats altars and closed doors as walls.
 2. Keep hold running all the way: recast the `hld` spell with a few turns to spare, with hold scrolls as backup.
    - Never read time warp while relying on hold.
-   - Hitting any monster ends the hold.
+   - Hitting any monster ends the hold, even one you could not see. A walk script must check each square for a monster before stepping, and stop on any "You hit" or attack message. One game, carrying the cure, broke a 723-turn hold by walking into an unseen xvart, and the prince on V4 then killed it.
+   - If the hold does break, read hold again at once and wield Slayer before anything else.
 3. Wield Slayer if you have it.
 4. On each arrival, read enlightenment, then walk the planned route to the up stairs.
 
@@ -244,7 +260,8 @@ Read stealth at the top of the shaft in town. The landing square is random and c
 - **Use `take_stairs` with care on DL1:** going down, it can route over the dungeon entrance and return you to town. Use `travel_to` to the stairs' x,y instead.
 - **`pick_up` with no target** also re-takes items you dropped.
 - **Pack slots** are 15 + CL/2. Sell junk before a big buy.
-- **To see a chest's plus,** wield something else, then the chest again.
+- **To see a chest's plus,** wield something else, then the chest again. `get_state` shows a wielded item's plus only in the "You wield ..." message, not in the inventory list.
+- **Budget the calls.** A game that takes 300+ calls to reach the volcano runs out before the climb. Aim to be on V1 by about call 150. A short Python script that sends many walking steps in one shell call cuts the count a lot, but it must stop at the first sign of trouble (HP drop, attack message, prompt).
 - **Helper scripts** from these games (BFS routes, Umaps matcher, effect timers, wall-preferring routes) are in the session scratchpad, not in the repo: `umatch.py`, `upath.py`, `bfs.py`, `wallpath.py`, `timers.py`. Worth turning into proper tools.
 
 ---
